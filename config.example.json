@@ -1,0 +1,13 @@
+{
+  "images_dir": "D:\\ShareFiles\\public\\foto",
+  "output_dir": "D:\\ShareFiles\\public\\xml",
+  "xml_filename": "images_export.xml",
+  "log_filename": "images_export.log",
+  "max_log_lines": 2000,
+  "images_base_url": "https://img.example.com/foto",
+  "task_user": "SYSTEM",
+  "allowed_extensions": [
+    ".jpg",
+    ".jpeg"
+  ]
+}

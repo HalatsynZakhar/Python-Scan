@@ -1,0 +1,2 @@
+watchdog==6.0.0
+tzdata==2026.2
