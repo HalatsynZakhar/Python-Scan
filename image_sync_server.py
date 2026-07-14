@@ -1278,6 +1278,9 @@ def render_page() -> str:
         <h2>Останні події</h2>
         <button id="archiveHistoryButton" class="secondary" type="button">Архівувати події</button>
       </div>
+      <div class="toolbar">
+        <button id="archiveHistoryInlineButton" class="secondary" type="button">Перенести останні події в архів</button>
+      </div>
       <div id="historyTable" class="table-wrap"><div class="empty">Завантаження...</div></div>
       <details>
         <summary>Архів</summary>
@@ -1306,7 +1309,7 @@ def render_page() -> str:
     const buttons = [
       'refreshButton', 'rebuildButton', 'syncDirtyButton', 'syncAllButton',
       'previewDirtyButton', 'refreshCatalogButton', 'previewExcelButton',
-      'syncExcelButton', 'archiveHistoryButton'
+      'syncExcelButton', 'archiveHistoryButton', 'archiveHistoryInlineButton'
     ].map((id) => document.getElementById(id));
     let activeJob = '';
 
@@ -1620,7 +1623,7 @@ def render_page() -> str:
         statusBox.textContent = error.message;
       }}
     }});
-    document.getElementById('archiveHistoryButton').addEventListener('click', async () => {{
+    async function archiveHistory() {{
       try {{
         const result = await api('/api/history/archive', {{ method: 'POST' }});
         statusBox.textContent = 'Події перенесено в архів: ' + (result.archived || 0);
@@ -1628,7 +1631,9 @@ def render_page() -> str:
       }} catch (error) {{
         statusBox.textContent = error.message;
       }}
-    }});
+    }}
+    document.getElementById('archiveHistoryButton').addEventListener('click', archiveHistory);
+    document.getElementById('archiveHistoryInlineButton').addEventListener('click', archiveHistory);
 
     refreshState().catch((error) => {{
       statusBox.textContent = error.message;
