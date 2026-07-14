@@ -8,9 +8,11 @@ import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
@@ -367,6 +369,144 @@ def load_or_refresh_catalog(
     return CatalogIndex.from_raw(products), {**meta, "source": "fresh"}
 
 
+def catalog_age_seconds(updated_at: str) -> int | None:
+    if not updated_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(updated_at)
+    except ValueError:
+        return None
+    return max(0, int((images_xml.now_kyiv() - parsed).total_seconds()))
+
+
+def resolve_target_articles(
+    *,
+    mode: str,
+    xml_products: dict[str, list[str]],
+    requested_articles: list[str] | None,
+) -> list[str]:
+    with STATE_LOCK:
+        dirty_articles = sorted(get_state().dirty, key=str.casefold)
+
+    if mode == "dirty":
+        target_articles = requested_articles or dirty_articles
+    elif mode in {"article", "excel"}:
+        target_articles = requested_articles or []
+    elif mode == "all":
+        target_articles = sorted(xml_products, key=str.casefold)
+    else:
+        raise ValueError("Невідомий режим синхронізації.")
+    return unique_articles(target_articles)
+
+
+def prepare_import_plan(
+    *,
+    settings: HoroshopSettings,
+    catalog: CatalogIndex,
+    xml_products: dict[str, list[str]],
+    target_articles: list[str],
+) -> dict[str, Any]:
+    prepared: list[dict[str, Any]] = []
+    skipped: list[dict[str, str]] = []
+    preview: list[dict[str, Any]] = []
+
+    for local_article in target_articles:
+        image_urls = xml_products.get(local_article, [])
+        match = catalog.match(local_article)
+        item, reason = build_import_product(
+            match=match,
+            image_urls=image_urls,
+            settings=settings,
+        )
+        remote_article = item["article"] if item is not None else ""
+        preview_item = {
+            "article": local_article,
+            "remote_article": remote_article,
+            "status": "ready" if item is not None else "skipped",
+            "message": reason,
+            "image_count": len(image_urls),
+            "sample_images": image_urls[:5],
+        }
+        preview.append(preview_item)
+        if item is None:
+            skipped.append({"article": local_article, "message": reason})
+            continue
+        prepared.append(
+            {
+                "local_article": local_article,
+                "remote_article": remote_article,
+                "item": item,
+                "has_images": bool(item.get(settings.image_field, {}).get("links")),
+                "image_urls": image_urls,
+            }
+        )
+
+    return {
+        "prepared": prepared,
+        "skipped": skipped,
+        "preview": preview,
+    }
+
+
+def validate_image_url(
+    url: str,
+    session: requests.Session,
+    *,
+    timeout: int = 10,
+    max_bytes: int = 5 * 1024 * 1024,
+) -> tuple[bool, str]:
+    try:
+        response = session.head(url, allow_redirects=True, timeout=timeout)
+        if response.status_code in {405, 403}:
+            response = session.get(url, stream=True, timeout=timeout)
+        response.raise_for_status()
+    except requests.RequestException as error:
+        return False, f"URL недоступний: {error}"
+
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type and content_type not in {"image/jpeg", "image/png", "image/gif"}:
+        return False, f"Некоректний MIME: {content_type}"
+
+    content_length = response.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max_bytes:
+                return False, "Файл більший за 5 МБ"
+        except ValueError:
+            pass
+    return True, "OK"
+
+
+def validate_prepared_images(
+    prepared: list[dict[str, Any]],
+    *,
+    progress: Any | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], dict[str, Any]]:
+    valid: list[dict[str, Any]] = []
+    failed: list[dict[str, str]] = []
+    checked = 0
+    session = requests.Session()
+
+    for item in prepared:
+        article = item["local_article"]
+        errors: list[str] = []
+        for url in item.get("image_urls", []):
+            checked += 1
+            if progress and checked % 10 == 0:
+                progress(checked, f"Перевірено URL фото: {checked}")
+            ok, message = validate_image_url(url, session)
+            if not ok:
+                errors.append(f"{url}: {message}")
+                if len(errors) >= 3:
+                    break
+        if errors:
+            failed.append({"article": article, "message": " | ".join(errors)})
+        else:
+            valid.append(item)
+
+    return valid, failed, {"checked_urls": checked}
+
+
 class SyncChangeHandler(FileSystemEventHandler):
     def __init__(self, config: dict[str, Any]):
         super().__init__()
@@ -463,18 +603,11 @@ def sync_job(
         xml_products = load_xml_products(XML_CONFIG["output_xml"])
         counts = image_counts(xml_products)
 
-        with STATE_LOCK:
-            dirty_articles = sorted(get_state().dirty, key=str.casefold)
-
-        if mode == "dirty":
-            target_articles = requested_articles or dirty_articles
-        elif mode in {"article", "excel"}:
-            target_articles = requested_articles or []
-        elif mode == "all":
-            target_articles = sorted(xml_products, key=str.casefold)
-        else:
-            raise ValueError("Невідомий режим синхронізації.")
-        target_articles = unique_articles(target_articles)
+        target_articles = resolve_target_articles(
+            mode=mode,
+            xml_products=xml_products,
+            requested_articles=requested_articles,
+        )
 
         if not target_articles:
             set_job(job_id, status="done", percent=100, message="Немає артикулів для оновлення.")
@@ -510,52 +643,64 @@ def sync_job(
             catalog_updated_at=catalog_meta.get("updated_at"),
         )
 
-        import_items: list[dict[str, Any]] = []
-        local_by_remote: dict[str, str] = {}
-        prepared_items: list[dict[str, Any]] = []
-        skipped: list[dict[str, str]] = []
         should_update_state = mode in {"dirty", "article", "excel"}
-        for local_article in target_articles:
-            match = catalog.match(local_article)
-            item, reason = build_import_product(
-                match=match,
-                image_urls=xml_products.get(local_article, []),
-                settings=settings,
-            )
-            if item is None:
-                skipped.append({"article": local_article, "message": reason})
+        plan = prepare_import_plan(
+            settings=settings,
+            catalog=catalog,
+            xml_products=xml_products,
+            target_articles=target_articles,
+        )
+        skipped: list[dict[str, str]] = plan["skipped"]
+        prepared_items: list[dict[str, Any]] = plan["prepared"]
+        for skipped_item in skipped:
+            if should_update_state:
+                with STATE_LOCK:
+                    state = get_state()
+                    state.mark_result(
+                        article=skipped_item["article"],
+                        status="skipped",
+                        message=skipped_item["message"],
+                        image_count=counts.get(skipped_item["article"], 0),
+                    )
+                    state.save()
+
+        def validation_progress(count: int, message: str) -> None:
+            set_job(job_id, status="running", percent=30, message=message, checked_urls=count)
+
+        set_job(job_id, status="running", percent=28, message="Перевірка посилань на фото...")
+        prepared_items, validation_failed, validation_meta = validate_prepared_images(
+            prepared_items,
+            progress=validation_progress,
+        )
+        if validation_failed:
+            for failed_item in validation_failed:
                 if should_update_state:
                     with STATE_LOCK:
                         state = get_state()
                         state.mark_result(
-                            article=local_article,
-                            status="skipped",
-                            message=reason,
-                            image_count=counts.get(local_article, 0),
+                            article=failed_item["article"],
+                            status="error",
+                            message=failed_item["message"],
+                            image_count=counts.get(failed_item["article"], 0),
                         )
                         state.save()
-                continue
-            import_items.append(item)
-            local_by_remote[item["article"]] = local_article
-            prepared_items.append(
-                {
-                    "local_article": local_article,
-                    "remote_article": item["article"],
-                    "item": item,
-                    "has_images": bool(
-                        item.get(settings.image_field, {}).get("links")
-                    ),
-                }
-            )
 
-        if not import_items:
+        if not prepared_items:
             set_job(
                 job_id,
                 status="done",
                 percent=100,
                 message="Немає підготовлених товарів для імпорту.",
                 skipped=skipped,
+                failed=validation_failed,
                 imported=0,
+                report={
+                    "prepared": 0,
+                    "skipped": skipped,
+                    "failed": validation_failed,
+                    "preview": plan["preview"],
+                    **validation_meta,
+                },
             )
             return
 
@@ -570,7 +715,7 @@ def sync_job(
                 percent=round(percent, 1),
                 message=f"Імпорт у Хорошоп: пакет {index} із {len(batches)}...",
                 imported=imported,
-                total=len(import_items),
+                total=len(prepared_items),
             )
             if settings.override and settings.two_phase_replace:
                 clear_items = [
@@ -665,9 +810,19 @@ def sync_job(
             imported=imported,
             skipped=skipped,
             failed=failed,
-            total=len(import_items),
+            total=len(prepared_items),
             catalog_source=catalog_meta.get("source"),
             catalog_updated_at=catalog_meta.get("updated_at"),
+            report={
+                "prepared": len(prepared_items),
+                "imported": imported,
+                "skipped": skipped,
+                "failed": [*validation_failed, *failed],
+                "preview": plan["preview"],
+                "checked_urls": validation_meta.get("checked_urls", 0),
+                "catalog_source": catalog_meta.get("source"),
+                "catalog_updated_at": catalog_meta.get("updated_at"),
+            },
         )
         log(
             f"Синхронізація Хорошоп завершена: mode={mode}, "
@@ -758,6 +913,99 @@ def start_catalog_refresh(credentials: dict[str, Any]) -> dict[str, str]:
     return {"job_id": job_id}
 
 
+def preview_job(
+    job_id: str,
+    mode: str,
+    credentials: dict[str, Any],
+    requested_articles: list[str] | None = None,
+    fresh_catalog: bool = False,
+) -> None:
+    base_settings = HOROSHOP_SETTINGS
+    if base_settings is None:
+        set_job(job_id, status="error", percent=100, message="Налаштування Хорошопа не ініціалізовано.")
+        return
+    if not SYNC_LOCK.acquire(blocking=False):
+        set_job(job_id, status="error", percent=100, message="Інша операція вже виконується.")
+        return
+    try:
+        settings = with_runtime_credentials(base_settings, credentials)
+        set_job(job_id, status="running", percent=5, message="Побудова XML і плану...")
+        build_xml(XML_CONFIG)
+        xml_products = load_xml_products(XML_CONFIG["output_xml"])
+        target_articles = resolve_target_articles(
+            mode=mode,
+            xml_products=xml_products,
+            requested_articles=requested_articles,
+        )
+        if not target_articles:
+            set_job(job_id, status="done", percent=100, message="Немає артикулів для перевірки.", report={"preview": []})
+            return
+        client = HoroshopClient(settings)
+
+        def export_progress(count: int, message: str) -> None:
+            set_job(job_id, status="running", percent=25, message=message, exported=count)
+
+        catalog, catalog_meta = load_or_refresh_catalog(
+            client=client,
+            force_refresh=fresh_catalog,
+            progress=export_progress,
+        )
+        plan = prepare_import_plan(
+            settings=settings,
+            catalog=catalog,
+            xml_products=xml_products,
+            target_articles=target_articles,
+        )
+
+        def validation_progress(count: int, message: str) -> None:
+            set_job(job_id, status="running", percent=70, message=message, checked_urls=count)
+
+        valid, failed, validation_meta = validate_prepared_images(
+            plan["prepared"],
+            progress=validation_progress,
+        )
+        report = {
+            "prepared": len(valid),
+            "skipped": plan["skipped"],
+            "failed": failed,
+            "preview": plan["preview"],
+            "checked_urls": validation_meta.get("checked_urls", 0),
+            "catalog_source": catalog_meta.get("source"),
+            "catalog_updated_at": catalog_meta.get("updated_at"),
+        }
+        set_job(
+            job_id,
+            status="done" if not failed else "warning",
+            percent=100,
+            message=(
+                f"Перевірка готова. До оновлення: {len(valid)}; "
+                f"пропущено: {len(plan['skipped'])}; помилок URL: {len(failed)}."
+            ),
+            report=report,
+        )
+    except (HoroshopError, OSError, ValueError) as error:
+        set_job(job_id, status="error", percent=100, message=str(error))
+    finally:
+        SYNC_LOCK.release()
+
+
+def start_preview(
+    mode: str,
+    credentials: dict[str, Any],
+    articles: list[str] | None = None,
+    fresh_catalog: bool = False,
+) -> dict[str, str]:
+    job_id = secrets.token_hex(12)
+    set_job(job_id, status="queued", percent=0, message="Очікування запуску перевірки...")
+    thread = threading.Thread(
+        target=preview_job,
+        args=(job_id, mode, credentials, articles, fresh_catalog),
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job_id}
+
+
 def state_snapshot() -> dict[str, Any]:
     xml_meta: dict[str, Any] = {}
     output_xml = XML_CONFIG.get("output_xml")
@@ -775,6 +1023,9 @@ def state_snapshot() -> dict[str, Any]:
         dirty = sorted(state.dirty.values(), key=lambda item: str(item.get("article", "")).casefold())
         history = list(reversed(state.history[-50:]))
         catalog_meta = state.catalog_meta()
+    catalog_meta["age_seconds"] = catalog_age_seconds(
+        str(catalog_meta.get("updated_at", ""))
+    )
     return {
         "busy": SYNC_LOCK.locked(),
         "dirty_count": len(dirty),
@@ -840,7 +1091,7 @@ def render_page() -> str:
       background: var(--panel);
     }}
     .fields {{ display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 10px; }}
-    .file-action {{ display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 10px; align-items: end; }}
+    .file-action {{ display: grid; grid-template-columns: minmax(180px, 1fr) auto auto; gap: 10px; align-items: end; }}
     label {{ display: grid; gap: 6px; font-weight: 700; color: #334155; }}
     input {{
       width: 100%;
@@ -865,6 +1116,17 @@ def render_page() -> str:
     button.danger {{ background: var(--bad); }}
     button.small {{ padding: 7px 10px; font-size: 13px; }}
     button:disabled {{ background: #94a3b8; cursor: wait; }}
+    details.danger-zone {{
+      border: 1px solid #fecaca;
+      border-radius: 8px;
+      background: #fff7f7;
+      padding: 12px 14px;
+    }}
+    details.danger-zone summary {{
+      cursor: pointer;
+      font-weight: 800;
+      color: var(--bad);
+    }}
     .status {{
       padding: 12px 14px;
       border: 1px solid var(--line);
@@ -885,6 +1147,13 @@ def render_page() -> str:
     .status-dirty {{ color: var(--warn); font-weight: 700; }}
     .status-error {{ color: var(--bad); font-weight: 700; }}
     .status-skipped {{ color: #475569; font-weight: 700; }}
+    .cache-fresh {{ color: var(--accent); font-weight: 700; }}
+    .cache-stale {{ color: var(--warn); font-weight: 700; }}
+    .cache-old {{ color: var(--bad); font-weight: 700; }}
+    .report-panel {{ display: none; }}
+    .report-panel.is-visible {{ display: block; }}
+    .report-stats {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }}
+    .report-chip {{ border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #fff; font-weight: 700; }}
     .empty {{ padding: 18px; color: var(--muted); }}
     @media (max-width: 760px) {{
       header {{ align-items: flex-start; flex-direction: column; }}
@@ -905,8 +1174,8 @@ def render_page() -> str:
     <div class="toolbar">
       <button id="refreshButton" class="secondary" type="button">Оновити статус</button>
       <button id="rebuildButton" class="secondary" type="button">Перебудувати XML</button>
+      <button id="previewDirtyButton" class="secondary" type="button">Перевірити змінені</button>
       <button id="syncDirtyButton" type="button">Оновити змінені артикули</button>
-      <button id="syncAllButton" class="danger" type="button">Повне оновлення</button>
     </div>
   </header>
   <main>
@@ -922,6 +1191,7 @@ def render_page() -> str:
           <label>Excel зі списком артикулів
             <input id="excelFile" type="file" accept=".xlsx,.xlsm">
           </label>
+          <button id="previewExcelButton" class="secondary" type="button">Перевірити Excel</button>
           <button id="syncExcelButton" type="button">Оновити артикули з Excel</button>
         </div>
       </div>
@@ -942,6 +1212,15 @@ def render_page() -> str:
       <div class="metric"><span>Режим</span><strong id="importMode">-</strong></div>
     </div>
     <div id="status" class="status">Завантаження...</div>
+    <section id="reportPanel" class="panel report-panel">
+      <h2>Результат останньої операції</h2>
+      <div id="reportContent"></div>
+    </section>
+    <details class="danger-zone">
+      <summary>Небезпечні дії</summary>
+      <p class="muted">Повне оновлення проходить по всіх артикулах XML. Для контрольованої роботи краще використовувати Excel-список.</p>
+      <button id="syncAllButton" class="danger" type="button">Повне оновлення</button>
+    </details>
     <section>
       <h2>Черга змін</h2>
       <div id="dirtyTable" class="table-wrap"><div class="empty">Завантаження...</div></div>
@@ -959,6 +1238,8 @@ def render_page() -> str:
     const importMode = document.getElementById('importMode');
     const dirtyTable = document.getElementById('dirtyTable');
     const historyTable = document.getElementById('historyTable');
+    const reportPanel = document.getElementById('reportPanel');
+    const reportContent = document.getElementById('reportContent');
     const shopLogin = document.getElementById('shopLogin');
     const shopPassword = document.getElementById('shopPassword');
     const excelFile = document.getElementById('excelFile');
@@ -966,7 +1247,7 @@ def render_page() -> str:
     const catalogStatus = document.getElementById('catalogStatus');
     const buttons = [
       'refreshButton', 'rebuildButton', 'syncDirtyButton', 'syncAllButton',
-      'refreshCatalogButton', 'syncExcelButton'
+      'previewDirtyButton', 'refreshCatalogButton', 'previewExcelButton', 'syncExcelButton'
     ].map((id) => document.getElementById(id));
     let activeJob = '';
 
@@ -1072,6 +1353,59 @@ def render_page() -> str:
       }});
     }}
 
+    function renderOperationReport(report) {{
+      if (!report) {{
+        reportPanel.classList.remove('is-visible');
+        reportContent.replaceChildren();
+        return;
+      }}
+      const failed = Array.isArray(report.failed) ? report.failed : [];
+      const skipped = Array.isArray(report.skipped) ? report.skipped : [];
+      const preview = Array.isArray(report.preview) ? report.preview : [];
+      const chips = [
+        ['Готово до оновлення', report.prepared ?? 0],
+        ['Успішно оновлено', report.imported ?? 0],
+        ['Пропущено', skipped.length],
+        ['Помилки', failed.length],
+        ['Перевірено URL', report.checked_urls ?? 0]
+      ];
+      let markup = '<div class="report-stats">';
+      for (const [label, value] of chips) {{
+        markup += '<div class="report-chip">' + escapeHtml(label) + ': ' + escapeHtml(value) + '</div>';
+      }}
+      markup += '</div>';
+      if (failed.length) {{
+        markup += '<h3>Помилки</h3><ul>';
+        failed.slice(0, 100).forEach((item) => {{
+          markup += '<li><strong>' + escapeHtml(item.article || '') + '</strong>: ' + escapeHtml(item.message || '') + '</li>';
+        }});
+        markup += '</ul>';
+      }}
+      if (skipped.length) {{
+        markup += '<h3>Пропущено</h3><ul>';
+        skipped.slice(0, 100).forEach((item) => {{
+          markup += '<li><strong>' + escapeHtml(item.article || '') + '</strong>: ' + escapeHtml(item.message || '') + '</li>';
+        }});
+        markup += '</ul>';
+      }}
+      if (preview.length) {{
+        markup += '<h3>План</h3><div class="table-wrap"><table><thead><tr>' +
+          '<th>Артикул</th><th>H-артикул</th><th>Статус</th><th>Фото</th><th>Приклади URL</th>' +
+          '</tr></thead><tbody>';
+        preview.slice(0, 150).forEach((item) => {{
+          const samples = Array.isArray(item.sample_images) ? item.sample_images.slice(0, 3).join('\\n') : '';
+          markup += '<tr><td><strong>' + escapeHtml(item.article || '') + '</strong></td>' +
+            '<td>' + escapeHtml(item.remote_article || '') + '</td>' +
+            '<td>' + escapeHtml(item.status || '') + '</td>' +
+            '<td>' + escapeHtml(item.image_count ?? 0) + '</td>' +
+            '<td style="white-space:pre-wrap;">' + escapeHtml(samples) + '</td></tr>';
+        }});
+        markup += '</tbody></table></div>';
+      }}
+      reportContent.innerHTML = markup;
+      reportPanel.classList.add('is-visible');
+    }}
+
     async function refreshState() {{
       const state = await api('/api/state');
       dirtyCount.textContent = state.dirty_count;
@@ -1082,6 +1416,15 @@ def render_page() -> str:
       renderTable(historyTable, state.history || []);
       const xml = state.xml || {{}};
       const catalog = state.catalog || {{}};
+      const age = Number(catalog.age_seconds);
+      const cacheClass = !catalog.has_cache
+        ? 'muted'
+        : age > 7 * 24 * 3600
+          ? 'cache-old'
+          : age > 24 * 3600
+            ? 'cache-stale'
+            : 'cache-fresh';
+      catalogStatus.className = cacheClass;
       catalogStatus.textContent = catalog.has_cache
         ? 'Імпорт сайту: ' + (catalog.products_count || 0) +
           ' товарів, оновлено ' + (catalog.updated_at || '-')
@@ -1101,6 +1444,7 @@ def render_page() -> str:
         statusBox.textContent = Math.round(job.percent || 0) + '% - ' + (job.message || '');
         if (job.status === 'done' || job.status === 'warning' || job.status === 'error') {{
           activeJob = '';
+          renderOperationReport(job.report);
           await refreshState();
           return;
         }}
@@ -1119,6 +1463,14 @@ def render_page() -> str:
         statusBox.textContent = error.message;
       }} finally {{
         setBusy(false);
+      }}
+    }});
+    document.getElementById('previewDirtyButton').addEventListener('click', async () => {{
+      try {{
+        const result = await api('/api/preview/dirty', {{ method: 'POST', body: credentialFormData() }});
+        pollJob(result.job_id);
+      }} catch (error) {{
+        statusBox.textContent = error.message;
       }}
     }});
     document.getElementById('syncDirtyButton').addEventListener('click', async () => {{
@@ -1145,6 +1497,20 @@ def render_page() -> str:
       try {{
         requireFullUpdateCredentials();
         const result = await api('/api/sync/all', {{ method: 'POST', body: credentialFormData() }});
+        pollJob(result.job_id);
+      }} catch (error) {{
+        statusBox.textContent = error.message;
+      }}
+    }});
+    document.getElementById('previewExcelButton').addEventListener('click', async () => {{
+      try {{
+        if (!excelFile.files.length) throw new Error('Виберіть Excel-файл зі списком артикулів.');
+        const data = credentialFormData();
+        data.append('file', excelFile.files[0], excelFile.files[0].name);
+        const result = await api('/api/preview/excel', {{
+          method: 'POST',
+          body: data
+        }});
         pollJob(result.job_id);
       }} catch (error) {{
         statusBox.textContent = error.message;
@@ -1292,6 +1658,46 @@ async def api_sync_excel(request: Request) -> dict[str, Any]:
     if not articles:
         raise HTTPException(status_code=400, detail="В Excel не знайдено артикулів у першому стовпці.")
     result = start_sync(
+        "excel",
+        credentials_from_form(form),
+        articles,
+        fresh_catalog=fresh_catalog_from_form(form),
+    )
+    result["articles_count"] = len(articles)
+    return result
+
+
+@app.post("/api/preview/dirty")
+async def api_preview_dirty(request: Request) -> dict[str, str]:
+    protected_json(request)
+    form = await request.form()
+    return start_preview(
+        "dirty",
+        credentials_from_form(form),
+        fresh_catalog=fresh_catalog_from_form(form),
+    )
+
+
+@app.post("/api/preview/excel")
+async def api_preview_excel(request: Request) -> dict[str, Any]:
+    protected_json(request)
+    form = await request.form()
+    uploaded = form.get("file")
+    if not isinstance(uploaded, StarletteUploadFile):
+        raise HTTPException(status_code=400, detail="Excel-файл не передано.")
+    filename = uploaded.filename or ""
+    if Path(filename).suffix.lower() not in {".xlsx", ".xlsm"}:
+        raise HTTPException(status_code=400, detail="Підтримуються лише .xlsx та .xlsm.")
+    data = await uploaded.read()
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Excel-файл більший за 20 МБ.")
+    try:
+        articles = parse_excel_articles(data)
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=f"Не вдалося прочитати Excel: {error}") from error
+    if not articles:
+        raise HTTPException(status_code=400, detail="В Excel не знайдено артикулів у першому стовпці.")
+    result = start_preview(
         "excel",
         credentials_from_form(form),
         articles,

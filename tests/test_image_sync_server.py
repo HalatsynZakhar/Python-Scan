@@ -7,10 +7,14 @@ from openpyxl import Workbook
 
 from image_sync_server import (
     SyncState,
+    catalog_age_seconds,
     load_or_refresh_catalog,
     load_server_settings,
     parse_excel_articles,
+    prepare_import_plan,
+    validate_image_url,
 )
+from horoshop_sync import CatalogIndex, HoroshopSettings
 
 
 class ServerSettingsTests(unittest.TestCase):
@@ -119,6 +123,66 @@ class CatalogCacheTests(unittest.TestCase):
         self.assertEqual(meta["source"], "fresh")
         self.assertIn("REMOTE", catalog.by_article)
         self.assertEqual(state.catalog_meta()["products_count"], 1)
+
+
+class PreviewAndValidationTests(unittest.TestCase):
+    def test_prepare_import_plan_reports_preview_and_skips(self):
+        settings = HoroshopSettings(domain="https://shop.example.com", token="token")
+        catalog = CatalogIndex.from_raw(
+            [{"article": "REAL", "article_for_display": "DISPLAY"}]
+        )
+
+        plan = prepare_import_plan(
+            settings=settings,
+            catalog=catalog,
+            xml_products={"DISPLAY": ["https://img.example.com/DISPLAY.jpg"]},
+            target_articles=["DISPLAY", "MISSING"],
+        )
+
+        self.assertEqual(len(plan["prepared"]), 1)
+        self.assertEqual(plan["prepared"][0]["remote_article"], "REAL")
+        self.assertEqual(len(plan["skipped"]), 1)
+        self.assertEqual(plan["preview"][0]["sample_images"], ["https://img.example.com/DISPLAY.jpg"])
+
+    def test_validate_image_url_accepts_jpeg_under_limit(self):
+        class Response:
+            status_code = 200
+            headers = {
+                "content-type": "image/jpeg",
+                "content-length": "100",
+            }
+
+            def raise_for_status(self):
+                return None
+
+        class Session:
+            def head(self, *args, **kwargs):
+                return Response()
+
+        self.assertEqual(validate_image_url("https://img.example.com/a.jpg", Session()), (True, "OK"))
+
+    def test_validate_image_url_rejects_large_file(self):
+        class Response:
+            status_code = 200
+            headers = {
+                "content-type": "image/jpeg",
+                "content-length": str(6 * 1024 * 1024),
+            }
+
+            def raise_for_status(self):
+                return None
+
+        class Session:
+            def head(self, *args, **kwargs):
+                return Response()
+
+        ok, message = validate_image_url("https://img.example.com/a.jpg", Session())
+
+        self.assertFalse(ok)
+        self.assertIn("5 МБ", message)
+
+    def test_catalog_age_seconds_parses_iso_timestamp(self):
+        self.assertIsNone(catalog_age_seconds(""))
 
 
 if __name__ == "__main__":
