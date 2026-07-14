@@ -168,7 +168,13 @@ class SyncState:
             json.dump(payload, file, ensure_ascii=False, indent=2)
         os.replace(temp_file, self.state_file)
 
-    def mark_dirty(self, article: str, event_type: str, image_count: int | None) -> None:
+    def mark_dirty(
+        self,
+        article: str,
+        event_type: str,
+        image_count: int | None,
+        message: str | None = None,
+    ) -> None:
         article = normalize_article(article)
         if not article:
             return
@@ -181,7 +187,7 @@ class SyncState:
             "event_type": event_type,
             "events": int(existing.get("events", 0)) + 1,
             "status": "dirty",
-            "message": "Очікує оновлення в Хорошопі.",
+            "message": message or "Очікує оновлення в Хорошопі.",
             "image_count": image_count,
         }
 
@@ -375,6 +381,37 @@ def add_manual_dirty_article(article: str) -> dict[str, Any]:
         "image_count": len(images),
         "sample_images": images[:5],
     }
+
+
+def queue_preview_articles(
+    *,
+    plan: dict[str, Any],
+    validation_failed: list[dict[str, str]],
+    counts: dict[str, int],
+    event_type: str,
+) -> dict[str, Any]:
+    failed_messages = {
+        normalize_article(item.get("article")): str(item.get("message", ""))
+        for item in validation_failed
+    }
+    queued = 0
+    with STATE_LOCK:
+        state = get_state()
+        for item in plan.get("preview", []):
+            article = normalize_article(item.get("article"))
+            if not article:
+                continue
+            image_count = counts.get(article, int(item.get("image_count") or 0))
+            if article in failed_messages:
+                message = f"Перевірено через Excel. Помилка URL: {failed_messages[article]}"
+            elif item.get("status") == "ready":
+                message = "Перевірено через Excel. Можна оновити точково або разом з чергою."
+            else:
+                message = f"Перевірено через Excel. {item.get('message') or 'Потрібна увага.'}"
+            state.mark_dirty(article, event_type, image_count, message=message)
+            queued += 1
+        state.save()
+    return {"queued": queued}
 
 
 def credentials_from_form(form: Any) -> dict[str, str]:
@@ -1031,6 +1068,7 @@ def preview_job(
         set_job(job_id, status="running", percent=5, message="Побудова XML і плану...")
         build_xml(XML_CONFIG)
         xml_products = load_xml_products(XML_CONFIG["output_xml"])
+        counts = image_counts(xml_products)
         target_articles = resolve_target_articles(
             mode=mode,
             xml_products=xml_products,
@@ -1063,23 +1101,40 @@ def preview_job(
             plan["prepared"],
             progress=validation_progress,
         )
+        queue_meta: dict[str, Any] = {}
+        if mode == "excel":
+            queue_meta = queue_preview_articles(
+                plan=plan,
+                validation_failed=failed,
+                counts=counts,
+                event_type="excel",
+            )
         report = {
             "prepared": len(valid),
             "skipped": plan["skipped"],
             "failed": failed,
-            "preview": plan["preview"],
+            "preview": [] if mode == "excel" else plan["preview"],
             "checked_urls": validation_meta.get("checked_urls", 0),
             "catalog_source": catalog_meta.get("source"),
             "catalog_updated_at": catalog_meta.get("updated_at"),
+            **queue_meta,
         }
+        if mode == "excel":
+            message = (
+                f"Перевірка Excel готова. Додано в чергу: {queue_meta.get('queued', 0)}; "
+                f"готово до оновлення: {len(valid)}; пропущено: {len(plan['skipped'])}; "
+                f"помилок URL: {len(failed)}."
+            )
+        else:
+            message = (
+                f"Перевірка готова. До оновлення: {len(valid)}; "
+                f"пропущено: {len(plan['skipped'])}; помилок URL: {len(failed)}."
+            )
         set_job(
             job_id,
             status="done" if not failed else "warning",
             percent=100,
-            message=(
-                f"Перевірка готова. До оновлення: {len(valid)}; "
-                f"пропущено: {len(plan['skipped'])}; помилок URL: {len(failed)}."
-            ),
+            message=message,
             report=report,
         )
     except (HoroshopError, OSError, ValueError) as error:
@@ -1321,7 +1376,7 @@ def render_page() -> str:
           <label>Excel зі списком артикулів
             <input id="excelFile" type="file" accept=".xlsx,.xlsm">
           </label>
-          <button id="previewExcelButton" class="secondary" type="button">Перевірити Excel</button>
+          <button id="previewExcelButton" class="secondary" type="button">Перевірити Excel і додати в чергу</button>
           <button id="syncExcelButton" type="button">Оновити артикули з Excel</button>
         </div>
       </div>
@@ -1597,6 +1652,9 @@ def render_page() -> str:
         ['Помилки', failed.length],
         ['Перевірено URL', report.checked_urls ?? 0]
       ];
+      if (report.queued !== undefined) {{
+        chips.splice(1, 0, ['Додано в чергу', report.queued ?? 0]);
+      }}
       let markup = '<div class="report-stats">';
       for (const [label, value] of chips) {{
         markup += '<div class="report-chip">' + escapeHtml(label) + ': ' + escapeHtml(value) + '</div>';

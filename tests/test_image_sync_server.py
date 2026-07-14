@@ -14,6 +14,7 @@ from image_sync_server import (
     load_server_settings,
     parse_excel_articles,
     prepare_import_plan,
+    queue_preview_articles,
     validate_image_url,
 )
 from horoshop_sync import CatalogIndex, HoroshopSettings
@@ -236,6 +237,78 @@ class ManualDirtyArticleTests(unittest.TestCase):
                 image_sync_server.STATE = original_state
 
         self.assertEqual(state.dirty, {})
+
+
+class QueuePreviewArticleTests(unittest.TestCase):
+    def test_queue_preview_articles_adds_excel_preview_to_dirty_queue(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = SyncState(Path(temp_dir) / "state.json")
+
+            import image_sync_server
+
+            original_state = image_sync_server.STATE
+            image_sync_server.STATE = state
+            try:
+                result = queue_preview_articles(
+                    plan={
+                        "preview": [
+                            {
+                                "article": "READY",
+                                "status": "ready",
+                                "message": "OK",
+                                "image_count": 2,
+                            },
+                            {
+                                "article": "MISSING",
+                                "status": "skipped",
+                                "message": "Товар не знайдено на сайті.",
+                                "image_count": 1,
+                            },
+                        ]
+                    },
+                    validation_failed=[],
+                    counts={"READY": 2, "MISSING": 1},
+                    event_type="excel",
+                )
+            finally:
+                image_sync_server.STATE = original_state
+
+        self.assertEqual(result["queued"], 2)
+        self.assertEqual(set(state.dirty), {"READY", "MISSING"})
+        self.assertEqual(state.dirty["READY"]["image_count"], 2)
+        self.assertIn("Можна оновити", state.dirty["READY"]["message"])
+        self.assertIn("Товар не знайдено", state.dirty["MISSING"]["message"])
+
+    def test_queue_preview_articles_marks_url_errors_in_queue_message(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = SyncState(Path(temp_dir) / "state.json")
+
+            import image_sync_server
+
+            original_state = image_sync_server.STATE
+            image_sync_server.STATE = state
+            try:
+                queue_preview_articles(
+                    plan={
+                        "preview": [
+                            {
+                                "article": "BROKEN",
+                                "status": "ready",
+                                "message": "OK",
+                                "image_count": 1,
+                            }
+                        ]
+                    },
+                    validation_failed=[
+                        {"article": "BROKEN", "message": "URL недоступний"}
+                    ],
+                    counts={"BROKEN": 1},
+                    event_type="excel",
+                )
+            finally:
+                image_sync_server.STATE = original_state
+
+        self.assertIn("Помилка URL", state.dirty["BROKEN"]["message"])
 
 
 class PreviewAndValidationTests(unittest.TestCase):
