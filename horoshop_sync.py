@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin
@@ -35,6 +35,7 @@ class HoroshopSettings:
     batch_size: int = DEFAULT_BATCH_SIZE
     image_field: str = "images"
     override: bool = True
+    two_phase_replace: bool = True
     remove_all_when_no_local_images: bool = False
 
 
@@ -76,10 +77,6 @@ def load_horoshop_settings(raw: dict[str, Any]) -> HoroshopSettings:
     token = str(horoshop.get("token", "")).strip()
     login = str(horoshop.get("login", "")).strip()
     password = str(horoshop.get("password", ""))
-    if not token and (not login or not password):
-        raise ValueError(
-            "Заповніть horoshop.token або horoshop.login + horoshop.password."
-        )
 
     image_field = str(horoshop.get("image_field", "images")).strip()
     if image_field not in {"images", "gallery_common", "gallery_360"}:
@@ -104,10 +101,30 @@ def load_horoshop_settings(raw: dict[str, Any]) -> HoroshopSettings:
         batch_size=max(1, int(horoshop.get("batch_size", DEFAULT_BATCH_SIZE))),
         image_field=image_field,
         override=(mode == "replace"),
+        two_phase_replace=bool(horoshop.get("two_phase_replace", True)),
         remove_all_when_no_local_images=bool(
             horoshop.get("remove_all_when_no_local_images", False)
         ),
     )
+
+
+def with_runtime_credentials(
+    settings: HoroshopSettings,
+    credentials: dict[str, Any],
+) -> HoroshopSettings:
+    token = str(credentials.get("token", "")).strip()
+    login = str(credentials.get("login", "")).strip()
+    password = str(credentials.get("password", ""))
+
+    resolved = replace(
+        settings,
+        token=token or settings.token,
+        login=login or settings.login,
+        password=password or settings.password,
+    )
+    if not resolved.token and (not resolved.login or not resolved.password):
+        raise ValueError("Введіть логін і пароль Хорошопа на сторінці.")
+    return resolved
 
 
 def endpoint_url(domain: str, endpoint: str) -> str:
@@ -357,6 +374,22 @@ def build_import_product(
     )
 
 
+def build_clear_product(article: str, settings: HoroshopSettings) -> dict[str, Any]:
+    return {
+        "article": article,
+        settings.image_field: {"removeAll": True},
+    }
+
+
+def force_append_upload(item: dict[str, Any], settings: HoroshopSettings) -> dict[str, Any]:
+    copied = dict(item)
+    gallery = dict(copied.get(settings.image_field, {}))
+    if "links" in gallery:
+        gallery["override"] = False
+    copied[settings.image_field] = gallery
+    return copied
+
+
 def import_log_by_article(response: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     logs = response.get("response", {}).get("log", [])
     result: dict[str, list[dict[str, Any]]] = {}
@@ -382,13 +415,19 @@ def import_article_succeeded(
         return False
 
     codes: set[int] = set()
+    non_duplicate_error = False
     for entry in article_log:
         try:
-            codes.add(int(entry.get("code")))
+            code = int(entry.get("code"))
+            codes.add(code)
         except (TypeError, ValueError):
-            pass
+            code = None
+        message = str(entry.get("message", "")).casefold()
+        is_duplicate = "дубликат" in message or "дублікат" in message
+        if code in IMAGE_ERROR_CODES and not is_duplicate:
+            non_duplicate_error = True
 
-    if codes & IMAGE_ERROR_CODES:
+    if non_duplicate_error:
         return False
     return bool(codes & SUCCESS_IMPORT_CODES)
 
@@ -399,4 +438,3 @@ def chunked(items: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]
 
 def current_epoch() -> float:
     return time.time()
-

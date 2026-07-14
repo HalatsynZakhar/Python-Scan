@@ -6,22 +6,23 @@ from pathlib import Path
 from horoshop_sync import (
     CatalogIndex,
     HoroshopSettings,
+    build_clear_product,
     build_import_product,
+    force_append_upload,
     import_article_succeeded,
     import_log_by_article,
     load_horoshop_settings,
     load_xml_products,
+    with_runtime_credentials,
 )
 
 
 class HoroshopSettingsTests(unittest.TestCase):
-    def test_loads_login_password_and_panel_safe_defaults(self):
+    def test_loads_without_saved_credentials(self):
         settings = load_horoshop_settings(
             {
                 "horoshop": {
                     "domain": "https://shop.example.com/",
-                    "login": "api@example.com",
-                    "password": "secret",
                 }
             }
         )
@@ -29,7 +30,23 @@ class HoroshopSettingsTests(unittest.TestCase):
         self.assertEqual(settings.domain, "https://shop.example.com")
         self.assertEqual(settings.image_field, "images")
         self.assertTrue(settings.override)
+        self.assertTrue(settings.two_phase_replace)
         self.assertFalse(settings.remove_all_when_no_local_images)
+
+    def test_runtime_credentials_are_required_when_no_token_exists(self):
+        settings = HoroshopSettings(domain="https://shop.example.com")
+
+        with self.assertRaisesRegex(ValueError, "логін і пароль"):
+            with_runtime_credentials(settings, {})
+
+    def test_runtime_credentials_are_applied(self):
+        settings = with_runtime_credentials(
+            HoroshopSettings(domain="https://shop.example.com"),
+            {"login": "api@example.com", "password": "secret"},
+        )
+
+        self.assertEqual(settings.login, "api@example.com")
+        self.assertEqual(settings.password, "secret")
 
     def test_rejects_invalid_image_field(self):
         with self.assertRaisesRegex(ValueError, "image_field"):
@@ -152,6 +169,36 @@ class ImportPayloadTests(unittest.TestCase):
 
         self.assertEqual(item, {"article": "REAL", "images": {"removeAll": True}})
 
+    def test_two_phase_helpers_clear_then_upload_as_append(self):
+        settings = HoroshopSettings(
+            domain="https://shop.example.com",
+            token="token",
+            image_field="images",
+            override=True,
+        )
+        item = {
+            "article": "REAL",
+            "images": {
+                "override": True,
+                "links": ["https://img.example.com/REAL.jpg"],
+            },
+        }
+
+        self.assertEqual(
+            build_clear_product("REAL", settings),
+            {"article": "REAL", "images": {"removeAll": True}},
+        )
+        self.assertEqual(
+            force_append_upload(item, settings),
+            {
+                "article": "REAL",
+                "images": {
+                    "override": False,
+                    "links": ["https://img.example.com/REAL.jpg"],
+                },
+            },
+        )
+
 
 class ImportResponseTests(unittest.TestCase):
     def test_warning_with_image_error_is_failed(self):
@@ -179,6 +226,17 @@ class ImportResponseTests(unittest.TestCase):
             )
         )
 
+    def test_duplicate_messages_do_not_fail_successful_upload(self):
+        self.assertTrue(
+            import_article_succeeded(
+                "WARNING",
+                [
+                    {"code": 22, "message": "Изображение успешно загружено."},
+                    {"code": 26, "message": "Файл является дубликатом"},
+                ],
+            )
+        )
+
 
 class XmlProductTests(unittest.TestCase):
     def test_loads_current_xml_format(self):
@@ -196,4 +254,3 @@ class XmlProductTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

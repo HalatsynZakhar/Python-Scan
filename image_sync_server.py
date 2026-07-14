@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
-import base64
-import html
+import io
 import json
 import os
 import secrets
@@ -16,6 +14,8 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
+from openpyxl import load_workbook
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
@@ -25,8 +25,10 @@ from horoshop_sync import (
     HoroshopClient,
     HoroshopError,
     HoroshopSettings,
+    build_clear_product,
     build_import_product,
     chunked,
+    force_append_upload,
     current_epoch,
     import_article_succeeded,
     import_log_by_article,
@@ -34,6 +36,7 @@ from horoshop_sync import (
     load_xml_products,
     normalize_article,
     read_raw_config,
+    with_runtime_credentials,
 )
 from images_xml import (
     DEFAULT_CONFIG_FILE,
@@ -71,10 +74,6 @@ def load_server_settings(raw: dict[str, Any], xml_config: dict[str, Any]) -> dic
     if not isinstance(server, dict):
         raise ValueError("Секція server у config.json повинна бути об'єктом.")
 
-    password = str(server.get("access_password", ""))
-    if not password:
-        raise ValueError("Заповніть server.access_password у config.json.")
-
     state_file = server.get("state_file")
     if state_file:
         resolved_state_file = Path(str(state_file)).expanduser()
@@ -85,8 +84,6 @@ def load_server_settings(raw: dict[str, Any], xml_config: dict[str, Any]) -> dic
         "enabled": bool(server.get("enabled", False)),
         "host": str(server.get("host", "0.0.0.0")),
         "port": int(server.get("port", 8092)),
-        "access_user": str(server.get("access_user", "admin")),
-        "access_password": password,
         "state_file": resolved_state_file,
     }
 
@@ -222,37 +219,8 @@ def get_job(job_id: str) -> dict[str, Any]:
     return item
 
 
-def require_auth(request: Request) -> None:
-    expected_password = SERVER_SETTINGS.get("access_password", "")
-    expected_user = SERVER_SETTINGS.get("access_user", "admin")
-    header = request.headers.get("authorization", "")
-    if not header.lower().startswith("basic "):
-        raise_auth()
-
-    try:
-        decoded = base64.b64decode(header.split(" ", 1)[1]).decode("utf-8")
-        user, password = decoded.split(":", 1)
-    except (ValueError, UnicodeDecodeError):
-        raise_auth()
-        return
-
-    if not (
-        secrets.compare_digest(user, expected_user)
-        and secrets.compare_digest(password, expected_password)
-    ):
-        raise_auth()
-
-
-def raise_auth() -> None:
-    raise HTTPException(
-        status_code=401,
-        detail="Потрібен пароль доступу.",
-        headers={"WWW-Authenticate": 'Basic realm="Python Scan"'},
-    )
-
-
-def protected_json(request: Request) -> None:
-    require_auth(request)
+def protected_json(_: Request) -> None:
+    return
 
 
 def image_articles_from_event(event: FileSystemEvent, allowed_extensions: set[str]) -> set[str]:
@@ -277,6 +245,60 @@ def image_articles_from_event(event: FileSystemEvent, allowed_extensions: set[st
 
 def image_counts(xml_products: dict[str, list[str]]) -> dict[str, int]:
     return {article: len(urls) for article, urls in xml_products.items()}
+
+
+def credentials_from_form(form: Any) -> dict[str, str]:
+    return {
+        "login": str(form.get("login", "")).strip(),
+        "password": str(form.get("password", "")),
+        "token": str(form.get("token", "")).strip(),
+    }
+
+
+def unique_articles(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        article = normalize_article(value)
+        if not article:
+            continue
+        key = article.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(article)
+    return result
+
+
+def parse_excel_articles(data: bytes) -> list[str]:
+    workbook = load_workbook(
+        io.BytesIO(data),
+        read_only=True,
+        data_only=True,
+    )
+    try:
+        worksheet = workbook.worksheets[0]
+        values: list[str] = []
+        for row in worksheet.iter_rows(values_only=True):
+            if not row:
+                continue
+            value = row[0]
+            if value is None:
+                continue
+            text = normalize_article(value)
+            if not text:
+                continue
+            if text.casefold() in {
+                "article",
+                "артикул",
+                "артикул для відображення",
+                "артикул для отображения",
+            }:
+                continue
+            values.append(text)
+        return unique_articles(values)
+    finally:
+        workbook.close()
 
 
 class SyncChangeHandler(FileSystemEventHandler):
@@ -342,9 +364,14 @@ def start_observer() -> Observer:
     return observer
 
 
-def sync_job(job_id: str, mode: str) -> None:
-    settings = HOROSHOP_SETTINGS
-    if settings is None:
+def sync_job(
+    job_id: str,
+    mode: str,
+    credentials: dict[str, Any],
+    requested_articles: list[str] | None = None,
+) -> None:
+    base_settings = HOROSHOP_SETTINGS
+    if base_settings is None:
         set_job(
             job_id,
             status="error",
@@ -363,6 +390,7 @@ def sync_job(job_id: str, mode: str) -> None:
         return
 
     try:
+        settings = with_runtime_credentials(base_settings, credentials)
         set_job(job_id, status="running", percent=2, message="Оновлення XML...")
         build_xml(XML_CONFIG)
         xml_products = load_xml_products(XML_CONFIG["output_xml"])
@@ -372,11 +400,14 @@ def sync_job(job_id: str, mode: str) -> None:
             dirty_articles = sorted(get_state().dirty, key=str.casefold)
 
         if mode == "dirty":
-            target_articles = dirty_articles
+            target_articles = requested_articles or dirty_articles
+        elif mode in {"article", "excel"}:
+            target_articles = requested_articles or []
         elif mode == "all":
             target_articles = sorted(xml_products, key=str.casefold)
         else:
             raise ValueError("Невідомий режим синхронізації.")
+        target_articles = unique_articles(target_articles)
 
         if not target_articles:
             set_job(job_id, status="done", percent=100, message="Немає артикулів для оновлення.")
@@ -399,7 +430,9 @@ def sync_job(job_id: str, mode: str) -> None:
 
         import_items: list[dict[str, Any]] = []
         local_by_remote: dict[str, str] = {}
+        prepared_items: list[dict[str, Any]] = []
         skipped: list[dict[str, str]] = []
+        should_update_state = mode in {"dirty", "article", "excel"}
         for local_article in target_articles:
             match = catalog.match(local_article)
             item, reason = build_import_product(
@@ -409,7 +442,7 @@ def sync_job(job_id: str, mode: str) -> None:
             )
             if item is None:
                 skipped.append({"article": local_article, "message": reason})
-                if mode == "dirty":
+                if should_update_state:
                     with STATE_LOCK:
                         state = get_state()
                         state.mark_result(
@@ -422,6 +455,16 @@ def sync_job(job_id: str, mode: str) -> None:
                 continue
             import_items.append(item)
             local_by_remote[item["article"]] = local_article
+            prepared_items.append(
+                {
+                    "local_article": local_article,
+                    "remote_article": item["article"],
+                    "item": item,
+                    "has_images": bool(
+                        item.get(settings.image_field, {}).get("links")
+                    ),
+                }
+            )
 
         if not import_items:
             set_job(
@@ -436,7 +479,7 @@ def sync_job(job_id: str, mode: str) -> None:
 
         imported = 0
         failed: list[dict[str, str]] = []
-        batches = chunked(import_items, settings.batch_size)
+        batches = chunked(prepared_items, settings.batch_size)
         for index, batch in enumerate(batches, start=1):
             percent = 25 + ((index - 1) / len(batches)) * 70
             set_job(
@@ -447,18 +490,57 @@ def sync_job(job_id: str, mode: str) -> None:
                 imported=imported,
                 total=len(import_items),
             )
-            response = client.import_products(batch)
-            response_status = str(response.get("status", "OK")).upper()
-            logs = import_log_by_article(response)
+            if settings.override and settings.two_phase_replace:
+                clear_items = [
+                    build_clear_product(prepared["remote_article"], settings)
+                    for prepared in batch
+                ]
+                clear_response = client.import_products(clear_items)
+                clear_status = str(clear_response.get("status", "OK")).upper()
+                clear_logs = import_log_by_article(clear_response)
+                upload_items = [
+                    force_append_upload(prepared["item"], settings)
+                    for prepared in batch
+                    if prepared["has_images"]
+                ]
+                response = (
+                    client.import_products(upload_items)
+                    if upload_items
+                    else clear_response
+                )
+                response_status = str(response.get("status", "OK")).upper()
+                logs = import_log_by_article(response)
+            else:
+                raw_batch = [prepared["item"] for prepared in batch]
+                clear_status = ""
+                clear_logs = {}
+                response = client.import_products(raw_batch)
+                response_status = str(response.get("status", "OK")).upper()
+                logs = import_log_by_article(response)
 
-            for item in batch:
-                remote_article = item["article"]
-                local_article = local_by_remote.get(remote_article, remote_article)
+            for prepared in batch:
+                remote_article = prepared["remote_article"]
+                local_article = prepared["local_article"]
                 article_log = logs.get(remote_article, [])
-                success = import_article_succeeded(response_status, article_log)
+                clear_success = (
+                    True
+                    if not clear_status
+                    else import_article_succeeded(
+                        clear_status,
+                        clear_logs.get(remote_article, []),
+                    )
+                )
+                if settings.override and settings.two_phase_replace and not prepared["has_images"]:
+                    success = clear_success
+                    article_log = clear_logs.get(remote_article, [])
+                else:
+                    success = clear_success and import_article_succeeded(
+                        response_status,
+                        article_log,
+                    )
                 if success:
                     imported += 1
-                    if mode == "dirty":
+                    if should_update_state:
                         with STATE_LOCK:
                             state = get_state()
                             state.mark_result(
@@ -473,9 +555,12 @@ def sync_job(job_id: str, mode: str) -> None:
                 else:
                     message = "; ".join(
                         str(entry.get("message", entry)) for entry in article_log
+                    ) or "; ".join(
+                        str(entry.get("message", entry))
+                        for entry in clear_logs.get(remote_article, [])
                     ) or f"Статус імпорту: {response_status}"
                     failed.append({"article": local_article, "message": message})
-                    if mode == "dirty":
+                    if should_update_state:
                         with STATE_LOCK:
                             state = get_state()
                             state.mark_result(
@@ -511,10 +596,18 @@ def sync_job(job_id: str, mode: str) -> None:
         SYNC_LOCK.release()
 
 
-def start_sync(mode: str) -> dict[str, str]:
+def start_sync(
+    mode: str,
+    credentials: dict[str, Any],
+    articles: list[str] | None = None,
+) -> dict[str, str]:
     job_id = secrets.token_hex(12)
     set_job(job_id, status="queued", percent=0, message="Очікування запуску...")
-    thread = threading.Thread(target=sync_job, args=(job_id, mode), daemon=True)
+    thread = threading.Thread(
+        target=sync_job,
+        args=(job_id, mode, credentials, articles),
+        daemon=True,
+    )
     thread.start()
     return {"job_id": job_id}
 
@@ -552,7 +645,6 @@ def state_snapshot() -> dict[str, Any]:
 
 
 def render_page() -> str:
-    access_user = html.escape(SERVER_SETTINGS.get("access_user", "admin"))
     return f"""<!doctype html>
 <html lang="uk">
 <head>
@@ -591,6 +683,25 @@ def render_page() -> str:
     h1 {{ margin: 0; font-size: 22px; letter-spacing: 0; }}
     main {{ padding: 20px 24px 36px; display: grid; gap: 18px; }}
     .toolbar {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }}
+    .panel {{
+      display: grid;
+      gap: 12px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }}
+    .fields {{ display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 10px; }}
+    label {{ display: grid; gap: 6px; font-weight: 700; color: #334155; }}
+    input {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 11px;
+      font: inherit;
+      color: var(--ink);
+      background: #fff;
+    }}
     button {{
       border: 0;
       border-radius: 6px;
@@ -603,6 +714,7 @@ def render_page() -> str:
     button:hover {{ background: var(--accent-strong); }}
     button.secondary {{ background: #334155; }}
     button.danger {{ background: var(--bad); }}
+    button.small {{ padding: 7px 10px; font-size: 13px; }}
     button:disabled {{ background: #94a3b8; cursor: wait; }}
     .status {{
       padding: 12px 14px;
@@ -616,7 +728,7 @@ def render_page() -> str:
     .metric span {{ display: block; color: var(--muted); font-size: 13px; }}
     .metric strong {{ display: block; margin-top: 6px; font-size: 19px; }}
     .table-wrap {{ overflow: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }}
-    table {{ width: 100%; border-collapse: collapse; min-width: 760px; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 860px; }}
     th, td {{ padding: 10px 12px; border-bottom: 1px solid #e2e8f0; text-align: left; vertical-align: top; }}
     th {{ background: #eef2f7; font-size: 13px; color: #334155; }}
     tr:last-child td {{ border-bottom: 0; }}
@@ -629,6 +741,7 @@ def render_page() -> str:
       header {{ align-items: flex-start; flex-direction: column; }}
       main {{ padding: 16px; }}
       .grid {{ grid-template-columns: 1fr; }}
+      .fields {{ grid-template-columns: 1fr; }}
       button {{ width: 100%; }}
     }}
   </style>
@@ -637,7 +750,7 @@ def render_page() -> str:
   <header>
     <div>
       <h1>Horoshop Sync</h1>
-      <div class="muted">Локальний доступ: {access_user}</div>
+      <div class="muted">Локальна панель без окремого пароля</div>
     </div>
     <div class="toolbar">
       <button id="refreshButton" class="secondary" type="button">Оновити статус</button>
@@ -647,6 +760,23 @@ def render_page() -> str:
     </div>
   </header>
   <main>
+    <section class="panel">
+      <div class="fields">
+        <label>Логін Хорошоп
+          <input id="shopLogin" autocomplete="username" placeholder="api@example.com">
+        </label>
+        <label>Пароль Хорошоп
+          <input id="shopPassword" type="password" autocomplete="current-password">
+        </label>
+        <label>Excel зі списком артикулів
+          <input id="excelFile" type="file" accept=".xlsx,.xlsm">
+        </label>
+      </div>
+      <div class="toolbar">
+        <button id="syncExcelButton" type="button">Оновити артикули з Excel</button>
+      </div>
+      <div class="muted">В Excel читається перший стовпець першого аркуша: артикул для відображення на сайті.</div>
+    </section>
     <div class="grid">
       <div class="metric"><span>Змінені артикули</span><strong id="dirtyCount">0</strong></div>
       <div class="metric"><span>Стан синхронізації</span><strong id="busyState">-</strong></div>
@@ -671,6 +801,9 @@ def render_page() -> str:
     const importMode = document.getElementById('importMode');
     const dirtyTable = document.getElementById('dirtyTable');
     const historyTable = document.getElementById('historyTable');
+    const shopLogin = document.getElementById('shopLogin');
+    const shopPassword = document.getElementById('shopPassword');
+    const excelFile = document.getElementById('excelFile');
     const buttons = [
       'refreshButton', 'rebuildButton', 'syncDirtyButton', 'syncAllButton'
     ].map((id) => document.getElementById(id));
@@ -708,28 +841,57 @@ def render_page() -> str:
       return response.json();
     }}
 
+    function credentialFormData() {{
+      const login = shopLogin.value.trim();
+      const password = shopPassword.value;
+      if (!login || !password) {{
+        throw new Error('Введіть логін і пароль Хорошопа.');
+      }}
+      const data = new FormData();
+      data.append('login', login);
+      data.append('password', password);
+      return data;
+    }}
+
     function renderTable(target, rows) {{
       if (!rows.length) {{
         target.innerHTML = '<div class="empty">Немає записів.</div>';
         return;
       }}
       let markup = '<table><thead><tr>' +
-        '<th>Артикул</th><th>Статус</th><th>Фото</th><th>Оновлено</th><th>Повідомлення</th>' +
+        '<th>Артикул</th><th>Статус</th><th>Фото</th><th>Оновлено</th><th>Повідомлення</th><th>Дія</th>' +
         '</tr></thead><tbody>';
       for (const row of rows) {{
         const status = escapeHtml(row.status || '');
+        const article = escapeHtml(row.article || '');
         markup += '<tr>' +
-          '<td><strong>' + escapeHtml(row.article || '') + '</strong>' +
+          '<td><strong>' + article + '</strong>' +
           (row.remote_article ? '<div class="muted">H: ' + escapeHtml(row.remote_article) + '</div>' : '') +
           '</td>' +
           '<td class="status-' + status + '">' + status + '</td>' +
           '<td>' + escapeHtml(row.image_count ?? '') + '</td>' +
           '<td>' + escapeHtml(row.updated_at || row.first_seen_at || '') + '</td>' +
           '<td>' + escapeHtml(row.message || '') + '</td>' +
+          '<td><button class="small article-sync" type="button" data-article="' + article + '">Оновити</button></td>' +
           '</tr>';
       }}
       markup += '</tbody></table>';
       target.innerHTML = markup;
+      target.querySelectorAll('.article-sync').forEach((button) => {{
+        button.addEventListener('click', async () => {{
+          try {{
+            const data = credentialFormData();
+            const article = button.getAttribute('data-article') || '';
+            const result = await api('/api/sync/article/' + encodeURIComponent(article), {{
+              method: 'POST',
+              body: data
+            }});
+            pollJob(result.job_id);
+          }} catch (error) {{
+            statusBox.textContent = error.message;
+          }}
+        }});
+      }});
     }}
 
     async function refreshState() {{
@@ -777,13 +939,46 @@ def render_page() -> str:
       }}
     }});
     document.getElementById('syncDirtyButton').addEventListener('click', async () => {{
-      const result = await api('/api/sync/dirty', {{ method: 'POST' }});
-      pollJob(result.job_id);
+      try {{
+        const result = await api('/api/sync/dirty', {{ method: 'POST', body: credentialFormData() }});
+        pollJob(result.job_id);
+      }} catch (error) {{
+        statusBox.textContent = error.message;
+      }}
     }});
     document.getElementById('syncAllButton').addEventListener('click', async () => {{
-      if (!window.confirm('Запустити повне оновлення всіх артикулів із XML?')) return;
-      const result = await api('/api/sync/all', {{ method: 'POST' }});
-      pollJob(result.job_id);
+      const warning = [
+        'Повне оновлення пройде по всіх артикулах із XML.',
+        'У режимі replace галереї товарів будуть очищені й завантажені заново.',
+        'Якщо в XML неповний набір фото, на сайті залишиться саме неповний набір.',
+        'Для контрольованого оновлення краще використати Excel-файл зі списком потрібних артикулів.'
+      ].join('\\n');
+      if (!window.confirm(warning)) return;
+      const typed = window.prompt('Для запуску введіть: ПОВНЕ ОНОВЛЕННЯ');
+      if (typed !== 'ПОВНЕ ОНОВЛЕННЯ') {{
+        statusBox.textContent = 'Повне оновлення скасовано.';
+        return;
+      }}
+      try {{
+        const result = await api('/api/sync/all', {{ method: 'POST', body: credentialFormData() }});
+        pollJob(result.job_id);
+      }} catch (error) {{
+        statusBox.textContent = error.message;
+      }}
+    }});
+    document.getElementById('syncExcelButton').addEventListener('click', async () => {{
+      try {{
+        if (!excelFile.files.length) throw new Error('Виберіть Excel-файл зі списком артикулів.');
+        const data = credentialFormData();
+        data.append('file', excelFile.files[0], excelFile.files[0].name);
+        const result = await api('/api/sync/excel', {{
+          method: 'POST',
+          body: data
+        }});
+        pollJob(result.job_id);
+      }} catch (error) {{
+        statusBox.textContent = error.message;
+      }}
     }});
 
     refreshState().catch((error) => {{
@@ -815,7 +1010,6 @@ app = FastAPI(title="Python Scan Horoshop Sync", lifespan=lifespan)
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> str:
-    require_auth(request)
     return render_page()
 
 
@@ -849,15 +1043,48 @@ def api_rebuild(request: Request) -> dict[str, Any]:
 
 
 @app.post("/api/sync/dirty")
-def api_sync_dirty(request: Request) -> dict[str, str]:
+async def api_sync_dirty(request: Request) -> dict[str, str]:
     protected_json(request)
-    return start_sync("dirty")
+    form = await request.form()
+    return start_sync("dirty", credentials_from_form(form))
 
 
 @app.post("/api/sync/all")
-def api_sync_all(request: Request) -> dict[str, str]:
+async def api_sync_all(request: Request) -> dict[str, str]:
     protected_json(request)
-    return start_sync("all")
+    form = await request.form()
+    return start_sync("all", credentials_from_form(form))
+
+
+@app.post("/api/sync/article/{article}")
+async def api_sync_article(article: str, request: Request) -> dict[str, str]:
+    protected_json(request)
+    form = await request.form()
+    return start_sync("article", credentials_from_form(form), [article])
+
+
+@app.post("/api/sync/excel")
+async def api_sync_excel(request: Request) -> dict[str, Any]:
+    protected_json(request)
+    form = await request.form()
+    uploaded = form.get("file")
+    if not isinstance(uploaded, StarletteUploadFile):
+        raise HTTPException(status_code=400, detail="Excel-файл не передано.")
+    filename = uploaded.filename or ""
+    if Path(filename).suffix.lower() not in {".xlsx", ".xlsm"}:
+        raise HTTPException(status_code=400, detail="Підтримуються лише .xlsx та .xlsm.")
+    data = await uploaded.read()
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Excel-файл більший за 20 МБ.")
+    try:
+        articles = parse_excel_articles(data)
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=f"Не вдалося прочитати Excel: {error}") from error
+    if not articles:
+        raise HTTPException(status_code=400, detail="В Excel не знайдено артикулів у першому стовпці.")
+    result = start_sync("excel", credentials_from_form(form), articles)
+    result["articles_count"] = len(articles)
+    return result
 
 
 @app.get("/api/progress/{job_id}")
@@ -941,4 +1168,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

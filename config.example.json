@@ -4,19 +4,15 @@
   "xml_filename": "images_export.xml",
   "log_filename": "images_export.log",
   "max_log_lines": 2000,
-  "images_base_url": "https://img.example.com/foto",
+  "images_base_url": "image_base_url",
   "task_user": "SYSTEM",
   "server": {
     "enabled": true,
     "host": "0.0.0.0",
-    "port": 8092,
-    "access_user": "admin",
-    "access_password": "CHANGE_LOCAL_PANEL_PASSWORD"
+    "port": 8092
   },
   "horoshop": {
-    "domain": "https://example.com",
-    "login": "api@example.com",
-    "password": "CHANGE_HOROSHOP_API_PASSWORD",
+    "domain": "horoshop_domain",
     "token": "",
     "import_mode": "replace",
     "image_field": "images",
