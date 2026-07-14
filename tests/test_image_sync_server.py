@@ -6,6 +6,7 @@ from pathlib import Path
 from openpyxl import Workbook
 
 from image_sync_server import (
+    LOCAL_DATA_DIR,
     SyncState,
     add_manual_dirty_article,
     catalog_age_seconds,
@@ -35,8 +36,22 @@ class ServerSettingsTests(unittest.TestCase):
 
         self.assertTrue(settings["enabled"])
         self.assertEqual(settings["port"], 8092)
-        self.assertEqual(settings["state_file"], output_dir / "horoshop_sync_state.json")
+        self.assertEqual(settings["state_file"], LOCAL_DATA_DIR / "horoshop_sync_state.json")
         self.assertNotIn("access_password", settings)
+
+    def test_server_state_file_cannot_be_inside_public_output_dir(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            with self.assertRaises(ValueError):
+                load_server_settings(
+                    {
+                        "server": {
+                            "enabled": True,
+                            "state_file": str(output_dir / "horoshop_sync_state.json"),
+                        }
+                    },
+                    {"output_dir": output_dir},
+                )
 
 
 class ExcelArticleTests(unittest.TestCase):

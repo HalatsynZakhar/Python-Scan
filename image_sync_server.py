@@ -58,6 +58,7 @@ STATE_SCHEMA_VERSION = 1
 STATE_HISTORY_LIMIT = 300
 JOB_TTL_SECONDS = 60 * 60
 CATALOG_CACHE_MAX_ITEMS = 200_000
+LOCAL_DATA_DIR = Path(__file__).resolve().parent / "data"
 
 CONFIG_FILE = DEFAULT_CONFIG_FILE
 RAW_CONFIG: dict[str, Any] = {}
@@ -81,7 +82,17 @@ def load_server_settings(raw: dict[str, Any], xml_config: dict[str, Any]) -> dic
     if state_file:
         resolved_state_file = Path(str(state_file)).expanduser()
     else:
-        resolved_state_file = xml_config["output_dir"] / "horoshop_sync_state.json"
+        resolved_state_file = LOCAL_DATA_DIR / "horoshop_sync_state.json"
+
+    try:
+        resolved_state_file.resolve().relative_to(xml_config["output_dir"].resolve())
+    except ValueError:
+        pass
+    else:
+        raise ValueError(
+            "server.state_file не можна зберігати в output_dir. "
+            "У публічній папці мають бути лише images_export.xml та звичайний журнал."
+        )
 
     return {
         "enabled": bool(server.get("enabled", False)),
