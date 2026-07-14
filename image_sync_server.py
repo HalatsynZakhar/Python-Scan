@@ -1237,21 +1237,34 @@ def api_rebuild(request: Request) -> dict[str, Any]:
 async def api_sync_dirty(request: Request) -> dict[str, str]:
     protected_json(request)
     form = await request.form()
-    return start_sync("dirty", credentials_from_form(form))
+    return start_sync(
+        "dirty",
+        credentials_from_form(form),
+        fresh_catalog=fresh_catalog_from_form(form),
+    )
 
 
 @app.post("/api/sync/all")
 async def api_sync_all(request: Request) -> dict[str, str]:
     protected_json(request)
     form = await request.form()
-    return start_sync("all", credentials_from_form(form))
+    return start_sync(
+        "all",
+        credentials_from_form(form),
+        fresh_catalog=fresh_catalog_from_form(form),
+    )
 
 
 @app.post("/api/sync/article/{article}")
 async def api_sync_article(article: str, request: Request) -> dict[str, str]:
     protected_json(request)
     form = await request.form()
-    return start_sync("article", credentials_from_form(form), [article])
+    return start_sync(
+        "article",
+        credentials_from_form(form),
+        [article],
+        fresh_catalog=fresh_catalog_from_form(form),
+    )
 
 
 @app.post("/api/sync/excel")
@@ -1273,9 +1286,21 @@ async def api_sync_excel(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=f"Не вдалося прочитати Excel: {error}") from error
     if not articles:
         raise HTTPException(status_code=400, detail="В Excel не знайдено артикулів у першому стовпці.")
-    result = start_sync("excel", credentials_from_form(form), articles)
+    result = start_sync(
+        "excel",
+        credentials_from_form(form),
+        articles,
+        fresh_catalog=fresh_catalog_from_form(form),
+    )
     result["articles_count"] = len(articles)
     return result
+
+
+@app.post("/api/catalog/refresh")
+async def api_catalog_refresh(request: Request) -> dict[str, str]:
+    protected_json(request)
+    form = await request.form()
+    return start_catalog_refresh(credentials_from_form(form))
 
 
 @app.get("/api/progress/{job_id}")
