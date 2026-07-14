@@ -253,6 +253,23 @@ class SyncState:
         self.history.clear()
         return moved
 
+    def archive_history_item(self, article: str, updated_at: str = "") -> bool:
+        article = normalize_article(article)
+        if not article:
+            return False
+        for index, item in enumerate(self.history):
+            if normalize_article(item.get("article")) != article:
+                continue
+            item_updated_at = str(item.get("updated_at") or item.get("first_seen_at") or "")
+            if updated_at and item_updated_at != updated_at:
+                continue
+            archived = dict(self.history.pop(index))
+            archived["archived_at"] = timestamp()
+            self.archive.append(archived)
+            self.archive = self.archive[-STATE_HISTORY_LIMIT:]
+            return True
+        return False
+
 
 def get_state() -> SyncState:
     if STATE is None:
@@ -316,6 +333,37 @@ def image_articles_from_event(event: FileSystemEvent, allowed_extensions: set[st
 
 def image_counts(xml_products: dict[str, list[str]]) -> dict[str, int]:
     return {article: len(urls) for article, urls in xml_products.items()}
+
+
+def add_manual_dirty_article(article: str) -> dict[str, Any]:
+    normalized = normalize_article(article)
+    if not normalized:
+        raise ValueError("Введіть артикул для перевірки.")
+
+    build_xml(XML_CONFIG)
+    try:
+        xml_products = load_xml_products(XML_CONFIG["output_xml"])
+    except OSError as error:
+        raise ValueError(f"Не вдалося прочитати XML: {error}") from error
+
+    images = xml_products.get(normalized, [])
+    if not images:
+        raise ValueError(
+            f"У XML не знайдено фото для артикула {normalized}. "
+            "Перевірте назву файлу або папку з фото."
+        )
+
+    with STATE_LOCK:
+        state = get_state()
+        state.mark_dirty(normalized, "manual", len(images))
+        state.save()
+
+    return {
+        "ok": True,
+        "article": normalized,
+        "image_count": len(images),
+        "sample_images": images[:5],
+    }
 
 
 def credentials_from_form(form: Any) -> dict[str, str]:
@@ -1101,8 +1149,11 @@ def render_page() -> str:
       --line: #cbd3df;
       --accent: #166534;
       --accent-strong: #14532d;
+      --accent-soft: #dcfce7;
+      --focus: #2563eb;
       --warn: #a16207;
       --bad: #b91c1c;
+      --bad-soft: #fee2e2;
       --panel: #ffffff;
     }}
     * {{ box-sizing: border-box; }}
@@ -1134,6 +1185,7 @@ def render_page() -> str:
     }}
     .fields {{ display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 10px; }}
     .file-action {{ display: grid; grid-template-columns: minmax(180px, 1fr) auto auto; gap: 10px; align-items: end; }}
+    .manual-action {{ display: grid; grid-template-columns: minmax(180px, 360px) auto 1fr; gap: 10px; align-items: end; }}
     label {{ display: grid; gap: 6px; font-weight: 700; color: #334155; }}
     input {{
       width: 100%;
@@ -1143,6 +1195,18 @@ def render_page() -> str:
       font: inherit;
       color: var(--ink);
       background: #fff;
+      transition: border-color .15s ease, box-shadow .15s ease, background-color .15s ease;
+    }}
+    input:hover {{ border-color: #94a3b8; }}
+    input:focus {{
+      border-color: var(--focus);
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, .16);
+      outline: 0;
+    }}
+    input.input-error {{
+      border-color: var(--bad);
+      background: #fff7f7;
+      box-shadow: 0 0 0 3px rgba(185, 28, 28, .12);
     }}
     button {{
       border: 0;
@@ -1152,8 +1216,14 @@ def render_page() -> str:
       color: #fff;
       font-weight: 700;
       cursor: pointer;
+      transition: transform .08s ease, background-color .15s ease, box-shadow .15s ease;
     }}
     button:hover {{ background: var(--accent-strong); }}
+    button:active {{ transform: translateY(1px); }}
+    button:focus-visible {{
+      outline: 3px solid rgba(37, 99, 235, .28);
+      outline-offset: 2px;
+    }}
     button.secondary {{ background: #334155; }}
     button.danger {{ background: var(--bad); }}
     button.small {{ padding: 7px 10px; font-size: 13px; }}
@@ -1197,6 +1267,10 @@ def render_page() -> str:
     .report-stats {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }}
     .report-chip {{ border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #fff; font-weight: 700; }}
     .inline-meta {{ display: grid; gap: 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }}
+    .notice {{ padding: 11px 12px; border-radius: 8px; border: 1px solid var(--line); background: #fff; font-weight: 700; }}
+    .notice-warning {{ border-color: #fbbf24; background: #fffbeb; color: #78350f; }}
+    .notice-success {{ border-color: #86efac; background: var(--accent-soft); color: var(--accent-strong); }}
+    .is-hidden {{ display: none; }}
     .section-heading {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }}
     .empty {{ padding: 18px; color: var(--muted); }}
     @media (max-width: 760px) {{
@@ -1205,6 +1279,7 @@ def render_page() -> str:
       .grid {{ grid-template-columns: 1fr; }}
       .fields {{ grid-template-columns: 1fr; }}
       .file-action {{ grid-template-columns: 1fr; }}
+      .manual-action {{ grid-template-columns: 1fr; }}
       button {{ width: 100%; }}
     }}
   </style>
@@ -1238,6 +1313,16 @@ def render_page() -> str:
           <button id="previewExcelButton" class="secondary" type="button">Перевірити Excel</button>
           <button id="syncExcelButton" type="button">Оновити артикули з Excel</button>
         </div>
+      </div>
+      <div id="credentialNotice" class="notice notice-warning is-hidden">
+        Введіть логін і пароль Хорошопа перед перевіркою, експортом або оновленням.
+      </div>
+      <div class="manual-action">
+        <label>Додати артикул у чергу вручну
+          <input id="manualArticle" autocomplete="off" placeholder="Наприклад: X33">
+        </label>
+        <button id="manualAddButton" class="secondary" type="button">Перевірити і додати</button>
+        <div id="manualAddHint" class="muted">Перевіряє, чи є фото в локальному XML, і додає артикул у чергу змін.</div>
       </div>
       <div class="toolbar">
         <label style="display:flex;align-items:center;gap:8px;font-weight:700;">
@@ -1300,6 +1385,10 @@ def render_page() -> str:
     const reportContent = document.getElementById('reportContent');
     const shopLogin = document.getElementById('shopLogin');
     const shopPassword = document.getElementById('shopPassword');
+    const credentialNotice = document.getElementById('credentialNotice');
+    const manualArticle = document.getElementById('manualArticle');
+    const manualAddButton = document.getElementById('manualAddButton');
+    const manualAddHint = document.getElementById('manualAddHint');
     const excelFile = document.getElementById('excelFile');
     const freshCatalog = document.getElementById('freshCatalog');
     const catalogStatus = document.getElementById('catalogStatus');
@@ -1309,7 +1398,7 @@ def render_page() -> str:
     const buttons = [
       'refreshButton', 'rebuildButton', 'syncDirtyButton', 'syncAllButton',
       'previewDirtyButton', 'refreshCatalogButton', 'previewExcelButton',
-      'syncExcelButton', 'archiveHistoryButton', 'archiveHistoryInlineButton'
+      'syncExcelButton', 'manualAddButton', 'archiveHistoryButton', 'archiveHistoryInlineButton'
     ].map((id) => document.getElementById(id));
     let activeJob = '';
 
@@ -1349,8 +1438,10 @@ def render_page() -> str:
       const login = shopLogin.value.trim();
       const password = shopPassword.value;
       if (!login || !password) {{
+        showCredentialNotice('Введіть логін і пароль Хорошопа. Без них сайт не дозволить перевірити каталог або оновити фото.');
         throw new Error('Введіть логін і пароль Хорошопа.');
       }}
+      clearCredentialNotice();
       const data = new FormData();
       data.append('login', login);
       data.append('password', password);
@@ -1358,12 +1449,35 @@ def render_page() -> str:
       return data;
     }}
 
+    function showCredentialNotice(message) {{
+      credentialNotice.textContent = message;
+      credentialNotice.classList.remove('is-hidden');
+      credentialNotice.classList.add('notice-warning');
+      shopLogin.classList.toggle('input-error', !shopLogin.value.trim());
+      shopPassword.classList.toggle('input-error', !shopPassword.value);
+      if (!shopLogin.value.trim()) {{
+        shopLogin.focus();
+      }} else if (!shopPassword.value) {{
+        shopPassword.focus();
+      }}
+    }}
+
+    function clearCredentialNotice() {{
+      if (shopLogin.value.trim() && shopPassword.value) {{
+        credentialNotice.classList.add('is-hidden');
+        shopLogin.classList.remove('input-error');
+        shopPassword.classList.remove('input-error');
+      }}
+    }}
+
     function requireFullUpdateCredentials() {{
       const login = shopLogin.value.trim();
       const password = shopPassword.value;
       if (!login || !password) {{
+        showCredentialNotice('Для повного оновлення обов’язково введіть логін і пароль Хорошопа, а потім повторіть їх у підтвердженні.');
         throw new Error('Введіть логін і пароль Хорошопа.');
       }}
+      clearCredentialNotice();
       const repeatedLogin = window.prompt('Повторно введіть логін Хорошопа для повного оновлення:') || '';
       if (repeatedLogin.trim() !== login) {{
         throw new Error('Повторний логін не збігається. Повне оновлення скасовано.');
@@ -1374,7 +1488,7 @@ def render_page() -> str:
       }}
     }}
 
-    function renderTable(target, rows) {{
+    function renderTable(target, rows, mode = 'queue') {{
       if (!rows.length) {{
         target.innerHTML = '<div class="empty">Немає записів.</div>';
         return;
@@ -1385,17 +1499,26 @@ def render_page() -> str:
       for (const row of rows) {{
         const status = escapeHtml(row.status || '');
         const article = escapeHtml(row.article || '');
+        const updatedAt = escapeHtml(row.updated_at || row.first_seen_at || '');
+        let actions = '<span class="muted">-</span>';
+        if (mode === 'queue') {{
+          actions = '<button class="small article-sync" type="button" data-article="' + article + '">Оновити</button>' +
+            '<button class="small secondary article-skip" type="button" data-article="' + article + '">Пропустити</button>';
+        }} else if (mode === 'history') {{
+          actions = '<button class="small secondary history-archive" type="button" data-article="' + article + '" data-updated="' + updatedAt + '">Архівувати</button>';
+        }} else if (mode === 'archive') {{
+          actions = '<span class="muted">В архіві</span>';
+        }}
         markup += '<tr>' +
           '<td><strong>' + article + '</strong>' +
           (row.remote_article ? '<div class="muted">H: ' + escapeHtml(row.remote_article) + '</div>' : '') +
           '</td>' +
           '<td class="status-' + status + '">' + status + '</td>' +
           '<td>' + escapeHtml(row.image_count ?? '') + '</td>' +
-          '<td>' + escapeHtml(row.updated_at || row.first_seen_at || '') + '</td>' +
+          '<td>' + updatedAt + '</td>' +
           '<td>' + escapeHtml(row.message || '') + '</td>' +
           '<td><div class="toolbar">' +
-          '<button class="small article-sync" type="button" data-article="' + article + '">Оновити</button>' +
-          '<button class="small secondary article-skip" type="button" data-article="' + article + '">Пропустити</button>' +
+          actions +
           '</div></td>' +
           '</tr>';
       }}
@@ -1422,6 +1545,22 @@ def render_page() -> str:
             const article = button.getAttribute('data-article') || '';
             await api('/api/dirty/' + encodeURIComponent(article) + '/skip', {{
               method: 'POST'
+            }});
+            await refreshState();
+          }} catch (error) {{
+            statusBox.textContent = error.message;
+          }}
+        }});
+      }});
+      target.querySelectorAll('.history-archive').forEach((button) => {{
+        button.addEventListener('click', async () => {{
+          try {{
+            const data = new FormData();
+            data.append('article', button.getAttribute('data-article') || '');
+            data.append('updated_at', button.getAttribute('data-updated') || '');
+            await api('/api/history/archive-item', {{
+              method: 'POST',
+              body: data
             }});
             await refreshState();
           }} catch (error) {{
@@ -1490,9 +1629,9 @@ def render_page() -> str:
       busyState.textContent = state.busy ? 'Працює' : 'Вільно';
       imageField.textContent = state.image_field || '-';
       importMode.textContent = state.import_mode || '-';
-      renderTable(dirtyTable, state.dirty || []);
-      renderTable(historyTable, state.history || []);
-      renderTable(archiveTable, state.archive || []);
+      renderTable(dirtyTable, state.dirty || [], 'queue');
+      renderTable(historyTable, state.history || [], 'history');
+      renderTable(archiveTable, state.archive || [], 'archive');
       const xml = state.xml || {{}};
       const catalog = state.catalog || {{}};
       const age = Number(catalog.age_seconds);
@@ -1634,6 +1773,56 @@ def render_page() -> str:
     }}
     document.getElementById('archiveHistoryButton').addEventListener('click', archiveHistory);
     document.getElementById('archiveHistoryInlineButton').addEventListener('click', archiveHistory);
+    shopLogin.addEventListener('input', clearCredentialNotice);
+    shopPassword.addEventListener('input', clearCredentialNotice);
+
+    async function addManualArticle() {{
+      const article = manualArticle.value.trim();
+      if (!article) {{
+        manualArticle.classList.add('input-error');
+        manualArticle.focus();
+        manualAddHint.className = 'notice notice-warning';
+        manualAddHint.textContent = 'Введіть артикул, наприклад X33, щоб перевірити фото і додати його в чергу.';
+        return;
+      }}
+      manualArticle.classList.remove('input-error');
+      manualAddHint.className = 'muted';
+      manualAddHint.textContent = 'Перевіряю локальний XML і фото для артикула...';
+      try {{
+        const data = new FormData();
+        data.append('article', article);
+        const result = await api('/api/dirty/manual', {{
+          method: 'POST',
+          body: data
+        }});
+        manualArticle.value = '';
+        manualAddHint.className = 'notice notice-success';
+        manualAddHint.textContent = 'Артикул ' + result.article + ' додано в чергу. Фото: ' + result.image_count + '.';
+        statusBox.textContent = manualAddHint.textContent;
+        await refreshState();
+      }} catch (error) {{
+        manualArticle.classList.add('input-error');
+        manualArticle.focus();
+        manualAddHint.className = 'notice notice-warning';
+        manualAddHint.textContent = error.message;
+        statusBox.textContent = error.message;
+      }}
+    }}
+
+    manualAddButton.addEventListener('click', addManualArticle);
+    manualArticle.addEventListener('keydown', (event) => {{
+      if (event.key === 'Enter') {{
+        event.preventDefault();
+        addManualArticle();
+      }}
+    }});
+    manualArticle.addEventListener('input', () => {{
+      manualArticle.classList.remove('input-error');
+      if (!manualArticle.value.trim()) {{
+        manualAddHint.className = 'muted';
+        manualAddHint.textContent = 'Перевіряє, чи є фото в локальному XML, і додає артикул у чергу змін.';
+      }}
+    }});
 
     refreshState().catch((error) => {{
       statusBox.textContent = error.message;
@@ -1812,18 +2001,23 @@ def api_progress(job_id: str, request: Request) -> dict[str, Any]:
     return get_job(job_id)
 
 
+@app.post("/api/dirty/manual")
+async def api_mark_dirty_manual(request: Request) -> dict[str, Any]:
+    protected_json(request)
+    form = await request.form()
+    try:
+        return add_manual_dirty_article(str(form.get("article", "")))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
 @app.post("/api/dirty/{article}")
 def api_mark_dirty(article: str, request: Request) -> dict[str, Any]:
     protected_json(request)
-    with STATE_LOCK:
-        state = get_state()
-        try:
-            xml_products = load_xml_products(XML_CONFIG["output_xml"])
-        except OSError:
-            xml_products = {}
-        state.mark_dirty(article, "manual", len(xml_products.get(article, [])))
-        state.save()
-    return {"ok": True}
+    try:
+        return add_manual_dirty_article(article)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 @app.post("/api/dirty/{article}/skip")
@@ -1856,6 +2050,21 @@ def api_archive_history(request: Request) -> dict[str, Any]:
         moved = state.archive_history()
         state.save()
     return {"ok": True, "archived": moved}
+
+
+@app.post("/api/history/archive-item")
+async def api_archive_history_item(request: Request) -> dict[str, Any]:
+    protected_json(request)
+    form = await request.form()
+    article = str(form.get("article", ""))
+    updated_at = str(form.get("updated_at", ""))
+    with STATE_LOCK:
+        state = get_state()
+        archived = state.archive_history_item(article, updated_at)
+        state.save()
+    if not archived:
+        raise HTTPException(status_code=404, detail="Подію не знайдено в останніх подіях.")
+    return {"ok": True, "archived": 1}
 
 
 def configure_runtime(config_file: Path) -> None:

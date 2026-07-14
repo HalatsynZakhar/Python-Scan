@@ -7,6 +7,7 @@ from openpyxl import Workbook
 
 from image_sync_server import (
     SyncState,
+    add_manual_dirty_article,
     catalog_age_seconds,
     load_or_refresh_catalog,
     load_server_settings,
@@ -79,6 +80,20 @@ class CatalogCacheTests(unittest.TestCase):
         self.assertEqual(state.archive[-1]["article"], "X33")
         self.assertIn("archived_at", state.archive[-1])
 
+    def test_archive_history_item_moves_one_matching_event(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = SyncState(Path(temp_dir) / "state.json")
+            state.mark_dirty("X33", "manual", 2)
+            state.skip_dirty("X33")
+            state.mark_dirty("X34", "manual", 1)
+            state.skip_dirty("X34")
+
+            moved = state.archive_history_item("X33", state.history[0]["updated_at"])
+
+        self.assertTrue(moved)
+        self.assertEqual([item["article"] for item in state.history], ["X34"])
+        self.assertEqual(state.archive[-1]["article"], "X33")
+
     def test_state_persists_catalog_cache(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state_file = Path(temp_dir) / "state.json"
@@ -148,6 +163,64 @@ class CatalogCacheTests(unittest.TestCase):
         self.assertEqual(meta["source"], "fresh")
         self.assertIn("REMOTE", catalog.by_article)
         self.assertEqual(state.catalog_meta()["products_count"], 1)
+
+
+class ManualDirtyArticleTests(unittest.TestCase):
+    def test_add_manual_dirty_article_checks_xml_and_marks_queue(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "images"
+            images.mkdir()
+            (images / "X33.jpg").write_bytes(b"fake-image")
+
+            import image_sync_server
+
+            original_config = image_sync_server.XML_CONFIG
+            original_state = image_sync_server.STATE
+            state = SyncState(root / "state.json")
+            image_sync_server.XML_CONFIG = {
+                "images_dir": images,
+                "output_xml": root / "out" / "images.xml",
+                "base_url": "https://img.example.com/foto",
+                "allowed_extensions": {".jpg"},
+            }
+            image_sync_server.STATE = state
+            try:
+                result = add_manual_dirty_article(" X33 ")
+            finally:
+                image_sync_server.XML_CONFIG = original_config
+                image_sync_server.STATE = original_state
+
+        self.assertEqual(result["article"], "X33")
+        self.assertEqual(result["image_count"], 1)
+        self.assertIn("X33", state.dirty)
+
+    def test_add_manual_dirty_article_rejects_missing_images(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "images"
+            images.mkdir()
+
+            import image_sync_server
+
+            original_config = image_sync_server.XML_CONFIG
+            original_state = image_sync_server.STATE
+            state = SyncState(root / "state.json")
+            image_sync_server.XML_CONFIG = {
+                "images_dir": images,
+                "output_xml": root / "out" / "images.xml",
+                "base_url": "https://img.example.com/foto",
+                "allowed_extensions": {".jpg"},
+            }
+            image_sync_server.STATE = state
+            try:
+                with self.assertRaises(ValueError):
+                    add_manual_dirty_article("MISSING")
+            finally:
+                image_sync_server.XML_CONFIG = original_config
+                image_sync_server.STATE = original_state
+
+        self.assertEqual(state.dirty, {})
 
 
 class PreviewAndValidationTests(unittest.TestCase):
