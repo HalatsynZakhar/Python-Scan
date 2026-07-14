@@ -59,6 +59,7 @@ function Stop-ExistingImagesXmlRuntime {
         -Wait | Out-Null
 
     $PythonScript = Join-Path $InstallDir "images_xml.py"
+    $ServerScript = Join-Path $InstallDir "image_sync_server.py"
     $SupervisorScript = Join-Path $InstallDir "scripts\supervisor.ps1"
     $AutoUpdateBat = Join-Path $InstallDir "scripts\auto_update.bat"
 
@@ -68,6 +69,10 @@ function Stop-ExistingImagesXmlRuntime {
             $CommandLine -and (
                 $CommandLine.IndexOf(
                     $PythonScript,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -ge 0 -or
+                $CommandLine.IndexOf(
+                    $ServerScript,
                     [StringComparison]::OrdinalIgnoreCase
                 ) -ge 0 -or
                 $CommandLine.IndexOf(
@@ -415,7 +420,10 @@ function Initialize-PythonEnvironment {
     New-Item -ItemType Directory -Path "$InstallDir\logs" -Force |
         Out-Null
 
-    & $VenvPython -m compileall -q "$InstallDir\images_xml.py"
+    & $VenvPython -m compileall -q `
+        "$InstallDir\images_xml.py" `
+        "$InstallDir\horoshop_sync.py" `
+        "$InstallDir\image_sync_server.py"
     if ($LASTEXITCODE -ne 0) {
         throw "Перевірка Python-коду завершилася помилкою."
     }
@@ -482,9 +490,60 @@ function Create-ImagesXmlTask {
     }
 }
 
+function Get-ConfiguredWorkerName {
+    $ConfigPath = Join-Path $InstallDir "config.json"
+    try {
+        $Config = Get-Content $ConfigPath -Raw -Encoding UTF8 |
+            ConvertFrom-Json
+        if ($Config.server -and [bool]$Config.server.enabled) {
+            return "image_sync_server.py"
+        }
+    }
+    catch {
+        Write-Warning (
+            "Не вдалося визначити робочий процес із config.json: " +
+            $_.Exception.Message
+        )
+    }
+    return "images_xml.py"
+}
+
+function Configure-Firewall {
+    $ConfigPath = Join-Path $InstallDir "config.json"
+    try {
+        $Config = Get-Content $ConfigPath -Raw -Encoding UTF8 |
+            ConvertFrom-Json
+    }
+    catch {
+        Write-Warning "Не вдалося прочитати config.json для firewall."
+        return
+    }
+    if (!($Config.server -and [bool]$Config.server.enabled)) {
+        return
+    }
+
+    $Port = if ($Config.server.port) { [int]$Config.server.port } else { 8092 }
+    $RuleName = "PythonScanHoroshopSync-$Port"
+
+    Write-Output "Відкриття Windows Firewall TCP-порту $Port..."
+    $Existing = Get-NetFirewallRule `
+        -DisplayName $RuleName `
+        -ErrorAction SilentlyContinue
+    if ($Existing) {
+        Remove-NetFirewallRule -DisplayName $RuleName
+    }
+    New-NetFirewallRule `
+        -DisplayName $RuleName `
+        -Direction Inbound `
+        -Action Allow `
+        -Protocol TCP `
+        -LocalPort $Port | Out-Null
+}
+
 function Start-AndVerifyService {
     $PidFile = Join-Path $InstallDir "logs\images_xml.pid"
     $DiagnosticLog = Join-Path $InstallDir "logs\supervisor-local.log"
+    $WorkerName = Get-ConfiguredWorkerName
     Remove-Item $PidFile, $DiagnosticLog -Force -ErrorAction SilentlyContinue
 
     schtasks /Run /TN "ImagesXML" | Out-Null
@@ -516,7 +575,7 @@ function Start-AndVerifyService {
                     -ErrorAction SilentlyContinue
                 $WorkerIsRunning = (
                     $null -ne $ProcessInfo -and
-                    $ProcessInfo.CommandLine -like "*images_xml.py*"
+                    $ProcessInfo.CommandLine -like "*$WorkerName*"
                 )
             }
         }
@@ -684,6 +743,7 @@ Start-Process notepad.exe `
 Write-Output "Продовження автоматичного встановлення..."
 Configure-StorageAccess
 Initialize-PythonEnvironment
+Configure-Firewall
 Create-ImagesXmlTask
 Start-AndVerifyService
 Show-TaskAutonomyStatus

@@ -8,7 +8,11 @@ param(
 $ErrorActionPreference = "Stop"
 $AppDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $PythonExe = Join-Path $AppDir ".venv\Scripts\python.exe"
-$PythonScript = Join-Path $AppDir "images_xml.py"
+$ClockScript = Join-Path $AppDir "images_xml.py"
+$ImagesXmlScript = Join-Path $AppDir "images_xml.py"
+$ServerScript = Join-Path $AppDir "image_sync_server.py"
+$WorkerScript = $ImagesXmlScript
+$WorkerName = "images_xml.py"
 $PidFile = Join-Path $AppDir "logs\images_xml.pid"
 $LocalDiagnosticLog = Join-Path $AppDir "logs\supervisor-local.log"
 $WorkerOutputLog = Join-Path $AppDir "logs\python-output.log"
@@ -41,13 +45,20 @@ try {
     if ($Config.max_log_lines) {
         $MaxLogLines = [int]$Config.max_log_lines
     }
+    if (
+        $Config.server -and
+        [bool]$Config.server.enabled
+    ) {
+        $WorkerScript = $ServerScript
+        $WorkerName = "image_sync_server.py"
+    }
 }
 catch {
     Write-Warning "Не вдалося прочитати налаштування журналу: $($_.Exception.Message)"
 }
 
 function Initialize-ReliableClock {
-    $EpochOutput = & $PythonExe $PythonScript --print-utc-epoch 2>&1
+    $EpochOutput = & $PythonExe $ClockScript --print-utc-epoch 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Warning (
             "Не вдалося отримати час із Python; використовується системний " +
@@ -243,7 +254,7 @@ function Start-Worker {
 
     $script:Worker = Start-Process `
         -FilePath $PythonExe `
-        -ArgumentList "`"$PythonScript`"" `
+        -ArgumentList "`"$WorkerScript`"" `
         -WorkingDirectory $AppDir `
         -WindowStyle Hidden `
         -RedirectStandardOutput $WorkerOutputLog `
@@ -315,7 +326,7 @@ function Restore-WorkerFromPidFile {
         -Filter "ProcessId = $SavedPid" `
         -ErrorAction SilentlyContinue
 
-    if ($null -eq $ProcessInfo -or $ProcessInfo.CommandLine -notlike "*images_xml.py*") {
+    if ($null -eq $ProcessInfo -or $ProcessInfo.CommandLine -notlike "*$WorkerName*") {
         Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
         return
     }
@@ -375,7 +386,7 @@ Write-SupervisorLog (
     "Джерело часу ініціалізовано; якщо NTP недоступний, використовується " +
     "системний час. Зона Europe/Kyiv. " +
     "Супервізор запущено. Гілка: $Branch; перевірка Git кожні " +
-    "$CheckIntervalMinutes хв."
+    "$CheckIntervalMinutes хв. Робочий процес: $WorkerName."
 )
 Restore-WorkerFromPidFile
 $SupervisorTimer = [Diagnostics.Stopwatch]::StartNew()

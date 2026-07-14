@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 $AppDir = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $PythonScript = Join-Path $AppDir "images_xml.py"
+$ServerScript = Join-Path $AppDir "image_sync_server.py"
 $SupervisorScript = Join-Path $AppDir "scripts\supervisor.ps1"
 $AutoUpdateBat = Join-Path $AppDir "scripts\auto_update.bat"
 $PidFile = Join-Path $AppDir "logs\images_xml.pid"
@@ -53,6 +54,10 @@ function Stop-ProjectProcesses {
             $CommandLine -and (
                 $CommandLine.IndexOf(
                     $PythonScript,
+                    [StringComparison]::OrdinalIgnoreCase
+                ) -ge 0 -or
+                $CommandLine.IndexOf(
+                    $ServerScript,
                     [StringComparison]::OrdinalIgnoreCase
                 ) -ge 0 -or
                 $CommandLine.IndexOf(
@@ -111,7 +116,7 @@ Start-Sleep -Seconds 1
 Stop-ProjectProcesses
 
 Write-Output "Повну зупинку завершено:"
-Write-Output "- Python images_xml.py зупинено;"
+Write-Output "- Python images_xml.py / image_sync_server.py зупинено;"
 Write-Output "- BAT і супервізор автооновлення зупинені;"
 Write-Output "- завдання ImagesXML та ImagesXMLUpdate видалені;"
 Write-Output "- PID-файл видалено."
