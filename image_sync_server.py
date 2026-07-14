@@ -100,6 +100,7 @@ class SyncState:
         self.state_file = state_file
         self.dirty: dict[str, dict[str, Any]] = {}
         self.history: list[dict[str, Any]] = []
+        self.archive: list[dict[str, Any]] = []
         self.catalog_products: list[dict[str, Any]] = []
         self.catalog_updated_at = ""
         self.load()
@@ -113,6 +114,7 @@ class SyncState:
             return
         dirty = data.get("dirty", {})
         history = data.get("history", [])
+        archive = data.get("archive", [])
         catalog = data.get("catalog", {})
         if isinstance(dirty, dict):
             self.dirty = {
@@ -122,6 +124,10 @@ class SyncState:
             }
         if isinstance(history, list):
             self.history = [item for item in history if isinstance(item, dict)][
+                -STATE_HISTORY_LIMIT:
+            ]
+        if isinstance(archive, list):
+            self.archive = [item for item in archive if isinstance(item, dict)][
                 -STATE_HISTORY_LIMIT:
             ]
         if isinstance(catalog, dict):
@@ -139,6 +145,7 @@ class SyncState:
             "updated_at": timestamp(),
             "dirty": self.dirty,
             "history": self.history[-STATE_HISTORY_LIMIT:],
+            "archive": self.archive[-STATE_HISTORY_LIMIT:],
             "catalog": {
                 "updated_at": self.catalog_updated_at,
                 "products_count": len(self.catalog_products),
@@ -227,7 +234,24 @@ class SyncState:
             "updated_at": self.catalog_updated_at,
             "products_count": len(self.catalog_products),
             "has_cache": bool(self.catalog_products),
+            "local_path": str(self.state_file),
         }
+
+    def archive_history(self) -> int:
+        if not self.history:
+            return 0
+        moved = len(self.history)
+        archived_at = timestamp()
+        self.archive.extend(
+            {
+                **item,
+                "archived_at": archived_at,
+            }
+            for item in self.history
+        )
+        self.archive = self.archive[-STATE_HISTORY_LIMIT:]
+        self.history.clear()
+        return moved
 
 
 def get_state() -> SyncState:
@@ -1038,6 +1062,7 @@ def state_snapshot() -> dict[str, Any]:
         state = get_state()
         dirty = sorted(state.dirty.values(), key=lambda item: str(item.get("article", "")).casefold())
         history = list(reversed(state.history[-50:]))
+        archive = list(reversed(state.archive[-100:]))
         catalog_meta = state.catalog_meta()
     catalog_meta["age_seconds"] = catalog_age_seconds(
         str(catalog_meta.get("updated_at", ""))
@@ -1047,6 +1072,7 @@ def state_snapshot() -> dict[str, Any]:
         "dirty_count": len(dirty),
         "dirty": dirty,
         "history": history,
+        "archive": archive,
         "catalog": catalog_meta,
         "xml": xml_meta,
         "image_field": HOROSHOP_SETTINGS.image_field if HOROSHOP_SETTINGS else "",
@@ -1170,6 +1196,8 @@ def render_page() -> str:
     .report-panel.is-visible {{ display: block; }}
     .report-stats {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }}
     .report-chip {{ border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #fff; font-weight: 700; }}
+    .inline-meta {{ display: grid; gap: 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }}
+    .section-heading {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }}
     .empty {{ padding: 18px; color: var(--muted); }}
     @media (max-width: 760px) {{
       header {{ align-items: flex-start; flex-direction: column; }}
@@ -1216,9 +1244,13 @@ def render_page() -> str:
           <input id="freshCatalog" type="checkbox" style="width:auto;">
           Зробити свіжий експорт каталогу перед запуском
         </label>
-        <button id="refreshCatalogButton" class="secondary" type="button">Згенерувати імпорт сайту</button>
+        <button id="refreshCatalogButton" class="secondary" type="button">Згенерувати експорт сайту</button>
       </div>
-      <div id="catalogStatus" class="muted">Імпорт сайту ще не завантажено.</div>
+      <div class="inline-meta">
+        <div id="catalogStatus" class="muted">Експорт сайту ще не завантажено.</div>
+        <div class="muted">Останнє оновлення: <strong id="catalogUpdatedAt">-</strong></div>
+        <div class="muted">Локальний файл: <span id="catalogLocalPath">-</span></div>
+      </div>
       <div class="muted">В Excel читається перший стовпець першого аркуша: артикул для відображення на сайті.</div>
     </section>
     <div class="grid">
@@ -1242,8 +1274,15 @@ def render_page() -> str:
       <div id="dirtyTable" class="table-wrap"><div class="empty">Завантаження...</div></div>
     </section>
     <section>
-      <h2>Останні події</h2>
+      <div class="section-heading">
+        <h2>Останні події</h2>
+        <button id="archiveHistoryButton" class="secondary" type="button">Архівувати події</button>
+      </div>
       <div id="historyTable" class="table-wrap"><div class="empty">Завантаження...</div></div>
+      <details>
+        <summary>Архів</summary>
+        <div id="archiveTable" class="table-wrap"><div class="empty">Архів порожній.</div></div>
+      </details>
     </section>
   </main>
   <script>
@@ -1261,9 +1300,13 @@ def render_page() -> str:
     const excelFile = document.getElementById('excelFile');
     const freshCatalog = document.getElementById('freshCatalog');
     const catalogStatus = document.getElementById('catalogStatus');
+    const catalogUpdatedAt = document.getElementById('catalogUpdatedAt');
+    const catalogLocalPath = document.getElementById('catalogLocalPath');
+    const archiveTable = document.getElementById('archiveTable');
     const buttons = [
       'refreshButton', 'rebuildButton', 'syncDirtyButton', 'syncAllButton',
-      'previewDirtyButton', 'refreshCatalogButton', 'previewExcelButton', 'syncExcelButton'
+      'previewDirtyButton', 'refreshCatalogButton', 'previewExcelButton',
+      'syncExcelButton', 'archiveHistoryButton'
     ].map((id) => document.getElementById(id));
     let activeJob = '';
 
@@ -1446,6 +1489,7 @@ def render_page() -> str:
       importMode.textContent = state.import_mode || '-';
       renderTable(dirtyTable, state.dirty || []);
       renderTable(historyTable, state.history || []);
+      renderTable(archiveTable, state.archive || []);
       const xml = state.xml || {{}};
       const catalog = state.catalog || {{}};
       const age = Number(catalog.age_seconds);
@@ -1458,9 +1502,11 @@ def render_page() -> str:
             : 'cache-fresh';
       catalogStatus.className = cacheClass;
       catalogStatus.textContent = catalog.has_cache
-        ? 'Імпорт сайту: ' + (catalog.products_count || 0) +
+        ? 'Експорт сайту отримано: ' + (catalog.products_count || 0) +
           ' товарів, оновлено ' + (catalog.updated_at || '-')
-        : 'Імпорт сайту ще не створено. Перед першим оновленням буде виконано свіжий експорт каталогу.';
+        : 'Експорт сайту ще не створено. Перед першим оновленням буде виконано свіжий експорт каталогу.';
+      catalogUpdatedAt.textContent = catalog.updated_at || '-';
+      catalogLocalPath.textContent = catalog.local_path || '-';
       statusBox.textContent =
         'XML: ' + (xml.path || '-') + '\\n' +
         'Оновлено: ' + (xml.updated_at || '-') + '\\n' +
@@ -1570,6 +1616,15 @@ def render_page() -> str:
           body: data
         }});
         pollJob(result.job_id);
+      }} catch (error) {{
+        statusBox.textContent = error.message;
+      }}
+    }});
+    document.getElementById('archiveHistoryButton').addEventListener('click', async () => {{
+      try {{
+        const result = await api('/api/history/archive', {{ method: 'POST' }});
+        statusBox.textContent = 'Події перенесено в архів: ' + (result.archived || 0);
+        await refreshState();
       }} catch (error) {{
         statusBox.textContent = error.message;
       }}
@@ -1786,6 +1841,16 @@ def api_clear_dirty(request: Request) -> dict[str, Any]:
         state.clear_dirty()
         state.save()
     return {"ok": True}
+
+
+@app.post("/api/history/archive")
+def api_archive_history(request: Request) -> dict[str, Any]:
+    protected_json(request)
+    with STATE_LOCK:
+        state = get_state()
+        moved = state.archive_history()
+        state.save()
+    return {"ok": True, "archived": moved}
 
 
 def configure_runtime(config_file: Path) -> None:

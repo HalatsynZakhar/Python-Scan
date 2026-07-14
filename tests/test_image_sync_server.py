@@ -66,6 +66,19 @@ class CatalogCacheTests(unittest.TestCase):
         self.assertEqual(state.history[-1]["article"], "X33")
         self.assertEqual(state.history[-1]["status"], "skipped")
 
+    def test_archive_history_moves_current_history_to_archive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = SyncState(Path(temp_dir) / "state.json")
+            state.mark_dirty("X33", "manual", 2)
+            state.skip_dirty("X33")
+
+            moved = state.archive_history()
+
+        self.assertEqual(moved, 1)
+        self.assertEqual(state.history, [])
+        self.assertEqual(state.archive[-1]["article"], "X33")
+        self.assertIn("archived_at", state.archive[-1])
+
     def test_state_persists_catalog_cache(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state_file = Path(temp_dir) / "state.json"
@@ -80,6 +93,7 @@ class CatalogCacheTests(unittest.TestCase):
         self.assertEqual(loaded.catalog_meta()["products_count"], 1)
         self.assertTrue(loaded.catalog_meta()["has_cache"])
         self.assertEqual(loaded.catalog_products[0]["article"], "REAL")
+        self.assertEqual(loaded.catalog_meta()["local_path"], str(state_file))
 
     def test_load_or_refresh_catalog_uses_cache_when_allowed(self):
         class FakeClient:
