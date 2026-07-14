@@ -362,7 +362,7 @@ function Update-Project {
         throw "Не вдалося синхронізувати код з origin/$Branch."
     }
 
-    # Ігноровані config.json, .venv і logs зберігаються.
+    # Ігноровані config.json, .venv, logs і data зберігаються.
     git clean -fd
     if ($LASTEXITCODE -ne 0) {
         throw "Не вдалося видалити зайві невідстежувані файли."

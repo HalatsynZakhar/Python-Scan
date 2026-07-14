@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 
 logs/
+data/
 *.log
 
 config.json

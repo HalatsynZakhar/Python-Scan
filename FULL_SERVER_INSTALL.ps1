@@ -419,6 +419,8 @@ function Initialize-PythonEnvironment {
 
     New-Item -ItemType Directory -Path "$InstallDir\logs" -Force |
         Out-Null
+    New-Item -ItemType Directory -Path "$InstallDir\data" -Force |
+        Out-Null
 
     & $VenvPython -m compileall -q `
         "$InstallDir\images_xml.py" `
