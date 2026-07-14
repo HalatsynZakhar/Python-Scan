@@ -1267,8 +1267,58 @@ def render_page() -> str:
       border-radius: 8px;
       background: var(--panel);
     }}
-    .fields {{ display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 10px; }}
-    .file-action {{ display: grid; grid-template-columns: minmax(180px, 1fr) auto auto auto; gap: 10px; align-items: end; }}
+    .fields {{ display: grid; grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr); gap: 10px; }}
+    .excel-block {{ display: grid; gap: 10px; }}
+    .file-action {{ display: grid; grid-template-columns: minmax(280px, 1fr) auto auto; gap: 10px; align-items: stretch; }}
+    .excel-dropzone {{
+      position: relative;
+      display: grid;
+      gap: 5px;
+      align-content: center;
+      min-height: 86px;
+      width: 100%;
+      border: 2px solid var(--focus);
+      border-radius: 8px;
+      padding: 14px 46px 14px 14px;
+      background: #eff6ff;
+      color: #1e3a8a;
+      cursor: pointer;
+      font-weight: 800;
+      transition: border-color .15s ease, box-shadow .15s ease, background-color .15s ease, color .15s ease;
+    }}
+    .excel-dropzone:hover,
+    .excel-dropzone:focus-visible {{
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, .18);
+      outline: 0;
+    }}
+    .excel-dropzone.has-file {{
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+    }}
+    .excel-dropzone.is-empty {{
+      border-color: #dc2626;
+      background: #fff1f2;
+      color: #991b1b;
+    }}
+    .excel-dropzone small {{ color: inherit; font-weight: 700; opacity: .82; }}
+    .excel-input {{ position: absolute; inline-size: 1px; block-size: 1px; opacity: 0; pointer-events: none; }}
+    .detach-excel {{
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      display: none;
+      width: 30px;
+      height: 30px;
+      padding: 0;
+      border-radius: 999px;
+      background: var(--accent-strong);
+      color: #fff;
+      font-size: 20px;
+      line-height: 1;
+    }}
+    .excel-dropzone.has-file .detach-excel {{ display: inline-grid; place-items: center; }}
+    .detach-excel:hover {{ background: var(--bad); }}
     .manual-action {{ display: grid; grid-template-columns: minmax(180px, 360px) auto 1fr; gap: 10px; align-items: end; }}
     label {{ display: grid; gap: 6px; font-weight: 700; color: #334155; }}
     input {{
@@ -1390,13 +1440,17 @@ def render_page() -> str:
         <label>Пароль Хорошоп
           <input id="shopPassword" type="password" autocomplete="current-password">
         </label>
+      </div>
+      <div class="excel-block">
         <div class="file-action">
-          <label>Excel зі списком артикулів
-            <input id="excelFile" type="file" accept=".xlsx,.xlsm">
-          </label>
+          <div id="excelDropzone" class="excel-dropzone is-empty" role="button" tabindex="0" aria-label="Прикріпити Excel зі списком артикулів">
+            <span id="excelDropTitle">Прикріпити Excel зі списком артикулів</span>
+            <small id="excelDropHint">Файл не вибрано. Натисніть тут, щоб вибрати .xlsx або .xlsm.</small>
+            <button id="detachExcelButton" class="detach-excel" type="button" aria-label="Відкріпити Excel">×</button>
+            <input id="excelFile" class="excel-input" type="file" accept=".xlsx,.xlsm">
+          </div>
           <button id="previewExcelButton" class="secondary" type="button">Перевірити Excel і додати в чергу</button>
           <button id="syncExcelButton" type="button">Оновити артикули з Excel</button>
-          <button id="detachExcelButton" class="secondary" type="button">Відкріпити</button>
         </div>
       </div>
       <div id="credentialNotice" class="notice notice-warning is-hidden">
@@ -1482,6 +1536,9 @@ def render_page() -> str:
     const manualAddButton = document.getElementById('manualAddButton');
     const manualAddHint = document.getElementById('manualAddHint');
     const excelFile = document.getElementById('excelFile');
+    const excelDropzone = document.getElementById('excelDropzone');
+    const excelDropTitle = document.getElementById('excelDropTitle');
+    const excelDropHint = document.getElementById('excelDropHint');
     const freshCatalog = document.getElementById('freshCatalog');
     const catalogStatus = document.getElementById('catalogStatus');
     const catalogUpdatedAt = document.getElementById('catalogUpdatedAt');
@@ -1509,6 +1566,27 @@ def render_page() -> str:
       buttons.forEach((button) => {{
         if (button.id !== 'refreshButton') button.disabled = isBusy;
       }});
+    }}
+
+    function updateExcelDropzone() {{
+      const hasFile = Boolean(excelFile.files.length);
+      excelDropzone.classList.toggle('has-file', hasFile);
+      excelDropzone.classList.toggle('is-empty', !hasFile);
+      if (hasFile) {{
+        const file = excelFile.files[0];
+        excelDropTitle.textContent = file.name;
+        excelDropHint.textContent = 'Excel прикріплено. Натисніть ×, щоб відкріпити, або натисніть область, щоб замінити файл.';
+      }} else {{
+        excelDropTitle.textContent = 'Прикріпити Excel зі списком артикулів';
+        excelDropHint.textContent = 'Файл не вибрано. Натисніть тут, щоб вибрати .xlsx або .xlsm.';
+      }}
+    }}
+
+    function requireExcelFile() {{
+      if (excelFile.files.length) return;
+      updateExcelDropzone();
+      excelDropzone.focus();
+      throw new Error('Виберіть Excel-файл зі списком артикулів.');
     }}
 
     async function api(path, options = {{}}) {{
@@ -1824,7 +1902,7 @@ def render_page() -> str:
     }});
     document.getElementById('previewExcelButton').addEventListener('click', async () => {{
       try {{
-        if (!excelFile.files.length) throw new Error('Виберіть Excel-файл зі списком артикулів.');
+        requireExcelFile();
         const data = credentialFormData();
         data.append('file', excelFile.files[0], excelFile.files[0].name);
         const result = await api('/api/preview/excel', {{
@@ -1838,7 +1916,7 @@ def render_page() -> str:
     }});
     document.getElementById('syncExcelButton').addEventListener('click', async () => {{
       try {{
-        if (!excelFile.files.length) throw new Error('Виберіть Excel-файл зі списком артикулів.');
+        requireExcelFile();
         const data = credentialFormData();
         data.append('file', excelFile.files[0], excelFile.files[0].name);
         const result = await api('/api/sync/excel', {{
@@ -1850,14 +1928,32 @@ def render_page() -> str:
         statusBox.textContent = error.message;
       }}
     }});
-    document.getElementById('detachExcelButton').addEventListener('click', () => {{
+    excelDropzone.addEventListener('click', () => {{
+      excelFile.click();
+    }});
+    excelDropzone.addEventListener('keydown', (event) => {{
+      if (event.key === 'Enter' || event.key === ' ') {{
+        event.preventDefault();
+        excelFile.click();
+      }}
+    }});
+    excelFile.addEventListener('change', () => {{
+      updateExcelDropzone();
+      if (excelFile.files.length) {{
+        statusBox.textContent = 'Excel-файл прикріплено: ' + excelFile.files[0].name;
+      }}
+    }});
+    document.getElementById('detachExcelButton').addEventListener('click', (event) => {{
+      event.stopPropagation();
       if (!excelFile.files.length) {{
         statusBox.textContent = 'Excel-файл не прикріплено.';
+        updateExcelDropzone();
         return;
       }}
       const filename = excelFile.files[0].name;
       excelFile.value = '';
       excelFile.classList.remove('input-error');
+      updateExcelDropzone();
       statusBox.textContent = 'Excel-файл відкріплено: ' + filename + '. Черга змін не змінена.';
     }});
     document.getElementById('refreshCatalogButton').addEventListener('click', async () => {{
@@ -1961,6 +2057,7 @@ def render_page() -> str:
     refreshState().catch((error) => {{
       statusBox.textContent = error.message;
     }});
+    updateExcelDropzone();
     window.setInterval(() => {{
       if (!activeJob) refreshState().catch(() => {{}});
     }}, 10000);
