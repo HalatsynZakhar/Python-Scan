@@ -1268,7 +1268,7 @@ def render_page() -> str:
       background: var(--panel);
     }}
     .fields {{ display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 10px; }}
-    .file-action {{ display: grid; grid-template-columns: minmax(180px, 1fr) auto auto; gap: 10px; align-items: end; }}
+    .file-action {{ display: grid; grid-template-columns: minmax(180px, 1fr) auto auto auto; gap: 10px; align-items: end; }}
     .manual-action {{ display: grid; grid-template-columns: minmax(180px, 360px) auto 1fr; gap: 10px; align-items: end; }}
     label {{ display: grid; gap: 6px; font-weight: 700; color: #334155; }}
     input {{
@@ -1396,6 +1396,7 @@ def render_page() -> str:
           </label>
           <button id="previewExcelButton" class="secondary" type="button">Перевірити Excel і додати в чергу</button>
           <button id="syncExcelButton" type="button">Оновити артикули з Excel</button>
+          <button id="detachExcelButton" class="secondary" type="button">Відкріпити</button>
         </div>
       </div>
       <div id="credentialNotice" class="notice notice-warning is-hidden">
@@ -1489,8 +1490,9 @@ def render_page() -> str:
     const buttons = [
       'refreshButton', 'rebuildButton', 'syncDirtyButton', 'syncAllButton',
       'previewDirtyButton', 'refreshCatalogButton', 'previewExcelButton',
-      'syncExcelButton', 'manualAddButton', 'syncQueueButton', 'skipQueueButton',
-      'deleteQueueButton', 'archiveHistoryButton', 'archiveHistoryInlineButton'
+      'syncExcelButton', 'detachExcelButton', 'manualAddButton', 'syncQueueButton',
+      'skipQueueButton', 'deleteQueueButton', 'archiveHistoryButton',
+      'archiveHistoryInlineButton'
     ].map((id) => document.getElementById(id));
     let activeJob = '';
 
@@ -1847,6 +1849,16 @@ def render_page() -> str:
       }} catch (error) {{
         statusBox.textContent = error.message;
       }}
+    }});
+    document.getElementById('detachExcelButton').addEventListener('click', () => {{
+      if (!excelFile.files.length) {{
+        statusBox.textContent = 'Excel-файл не прикріплено.';
+        return;
+      }}
+      const filename = excelFile.files[0].name;
+      excelFile.value = '';
+      excelFile.classList.remove('input-error');
+      statusBox.textContent = 'Excel-файл відкріплено: ' + filename + '. Черга змін не змінена.';
     }});
     document.getElementById('refreshCatalogButton').addEventListener('click', async () => {{
       try {{
