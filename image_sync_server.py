@@ -55,6 +55,7 @@ from images_xml import (
 STATE_SCHEMA_VERSION = 1
 STATE_HISTORY_LIMIT = 300
 JOB_TTL_SECONDS = 60 * 60
+CATALOG_CACHE_MAX_ITEMS = 200_000
 
 CONFIG_FILE = DEFAULT_CONFIG_FILE
 RAW_CONFIG: dict[str, Any] = {}
@@ -97,6 +98,8 @@ class SyncState:
         self.state_file = state_file
         self.dirty: dict[str, dict[str, Any]] = {}
         self.history: list[dict[str, Any]] = []
+        self.catalog_products: list[dict[str, Any]] = []
+        self.catalog_updated_at = ""
         self.load()
 
     def load(self) -> None:
@@ -108,6 +111,7 @@ class SyncState:
             return
         dirty = data.get("dirty", {})
         history = data.get("history", [])
+        catalog = data.get("catalog", {})
         if isinstance(dirty, dict):
             self.dirty = {
                 normalize_article(article): item
@@ -118,6 +122,13 @@ class SyncState:
             self.history = [item for item in history if isinstance(item, dict)][
                 -STATE_HISTORY_LIMIT:
             ]
+        if isinstance(catalog, dict):
+            products = catalog.get("products", [])
+            if isinstance(products, list):
+                self.catalog_products = [
+                    item for item in products if isinstance(item, dict)
+                ][:CATALOG_CACHE_MAX_ITEMS]
+            self.catalog_updated_at = normalize_article(catalog.get("updated_at"))
 
     def save(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +137,11 @@ class SyncState:
             "updated_at": timestamp(),
             "dirty": self.dirty,
             "history": self.history[-STATE_HISTORY_LIMIT:],
+            "catalog": {
+                "updated_at": self.catalog_updated_at,
+                "products_count": len(self.catalog_products),
+                "products": self.catalog_products,
+            },
         }
         temp_file = self.state_file.with_suffix(f"{self.state_file.suffix}.tmp")
         with temp_file.open("w", encoding="utf-8") as file:
@@ -181,6 +197,19 @@ class SyncState:
 
     def clear_dirty(self) -> None:
         self.dirty.clear()
+
+    def set_catalog_products(self, products: list[dict[str, Any]]) -> None:
+        self.catalog_products = [
+            item for item in products if isinstance(item, dict)
+        ][:CATALOG_CACHE_MAX_ITEMS]
+        self.catalog_updated_at = timestamp()
+
+    def catalog_meta(self) -> dict[str, Any]:
+        return {
+            "updated_at": self.catalog_updated_at,
+            "products_count": len(self.catalog_products),
+            "has_cache": bool(self.catalog_products),
+        }
 
 
 def get_state() -> SyncState:
@@ -255,6 +284,15 @@ def credentials_from_form(form: Any) -> dict[str, str]:
     }
 
 
+def fresh_catalog_from_form(form: Any) -> bool:
+    return str(form.get("fresh_catalog", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def unique_articles(values: list[str]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -299,6 +337,34 @@ def parse_excel_articles(data: bytes) -> list[str]:
         return unique_articles(values)
     finally:
         workbook.close()
+
+
+def load_or_refresh_catalog(
+    *,
+    client: HoroshopClient,
+    force_refresh: bool,
+    progress: Any | None = None,
+) -> tuple[CatalogIndex, dict[str, Any]]:
+    with STATE_LOCK:
+        state = get_state()
+        cached_products = list(state.catalog_products)
+        cached_meta = state.catalog_meta()
+
+    if cached_products and not force_refresh:
+        return CatalogIndex.from_raw(cached_products), {
+            **cached_meta,
+            "source": "cache",
+        }
+
+    if progress:
+        progress(0, "Завантаження свіжого каталогу Хорошопа...")
+    products = client.export_catalog(progress=progress)
+    with STATE_LOCK:
+        state = get_state()
+        state.set_catalog_products(products)
+        state.save()
+        meta = state.catalog_meta()
+    return CatalogIndex.from_raw(products), {**meta, "source": "fresh"}
 
 
 class SyncChangeHandler(FileSystemEventHandler):
@@ -369,6 +435,7 @@ def sync_job(
     mode: str,
     credentials: dict[str, Any],
     requested_articles: list[str] | None = None,
+    fresh_catalog: bool = False,
 ) -> None:
     base_settings = HOROSHOP_SETTINGS
     if base_settings is None:
@@ -418,14 +485,29 @@ def sync_job(
         def export_progress(count: int, message: str) -> None:
             set_job(job_id, status="running", percent=10, message=message, exported=count)
 
-        set_job(job_id, status="running", percent=8, message="Завантаження каталогу Хорошопа...")
-        catalog = CatalogIndex.from_raw(client.export_catalog(progress=export_progress))
+        set_job(
+            job_id,
+            status="running",
+            percent=8,
+            message=(
+                "Завантаження каталогу Хорошопа..."
+                if fresh_catalog
+                else "Підготовка каталогу Хорошопа..."
+            ),
+        )
+        catalog, catalog_meta = load_or_refresh_catalog(
+            client=client,
+            force_refresh=fresh_catalog,
+            progress=export_progress,
+        )
         set_job(
             job_id,
             status="running",
             percent=25,
             message="Зіставлення артикулів...",
             catalog_products=len(catalog.products),
+            catalog_source=catalog_meta.get("source"),
+            catalog_updated_at=catalog_meta.get("updated_at"),
         )
 
         import_items: list[dict[str, Any]] = []
@@ -584,6 +666,8 @@ def sync_job(
             skipped=skipped,
             failed=failed,
             total=len(import_items),
+            catalog_source=catalog_meta.get("source"),
+            catalog_updated_at=catalog_meta.get("updated_at"),
         )
         log(
             f"Синхронізація Хорошоп завершена: mode={mode}, "
@@ -600,12 +684,74 @@ def start_sync(
     mode: str,
     credentials: dict[str, Any],
     articles: list[str] | None = None,
+    fresh_catalog: bool = False,
 ) -> dict[str, str]:
     job_id = secrets.token_hex(12)
     set_job(job_id, status="queued", percent=0, message="Очікування запуску...")
     thread = threading.Thread(
         target=sync_job,
-        args=(job_id, mode, credentials, articles),
+        args=(job_id, mode, credentials, articles, fresh_catalog),
+        daemon=True,
+    )
+    thread.start()
+    return {"job_id": job_id}
+
+
+def refresh_catalog_job(job_id: str, credentials: dict[str, Any]) -> None:
+    base_settings = HOROSHOP_SETTINGS
+    if base_settings is None:
+        set_job(
+            job_id,
+            status="error",
+            percent=100,
+            message="Налаштування Хорошопа не ініціалізовано.",
+        )
+        return
+
+    if not SYNC_LOCK.acquire(blocking=False):
+        set_job(
+            job_id,
+            status="error",
+            percent=100,
+            message="Інша операція вже виконується.",
+        )
+        return
+
+    try:
+        settings = with_runtime_credentials(base_settings, credentials)
+        client = HoroshopClient(settings)
+
+        def export_progress(count: int, message: str) -> None:
+            set_job(job_id, status="running", percent=50, message=message, exported=count)
+
+        set_job(job_id, status="running", percent=5, message="Старт експорту каталогу Хорошопа...")
+        catalog, meta = load_or_refresh_catalog(
+            client=client,
+            force_refresh=True,
+            progress=export_progress,
+        )
+        set_job(
+            job_id,
+            status="done",
+            percent=100,
+            message=f"Каталог оновлено: товарів {len(catalog.products)}.",
+            catalog_products=len(catalog.products),
+            catalog_updated_at=meta.get("updated_at"),
+        )
+        log(f"Кеш каталогу Хорошопа оновлено: товарів {len(catalog.products)}")
+    except (HoroshopError, OSError, ValueError) as error:
+        log(f"Помилка оновлення кешу каталогу Хорошопа: {error}")
+        set_job(job_id, status="error", percent=100, message=str(error))
+    finally:
+        SYNC_LOCK.release()
+
+
+def start_catalog_refresh(credentials: dict[str, Any]) -> dict[str, str]:
+    job_id = secrets.token_hex(12)
+    set_job(job_id, status="queued", percent=0, message="Очікування запуску...")
+    thread = threading.Thread(
+        target=refresh_catalog_job,
+        args=(job_id, credentials),
         daemon=True,
     )
     thread.start()
@@ -628,11 +774,13 @@ def state_snapshot() -> dict[str, Any]:
         state = get_state()
         dirty = sorted(state.dirty.values(), key=lambda item: str(item.get("article", "")).casefold())
         history = list(reversed(state.history[-50:]))
+        catalog_meta = state.catalog_meta()
     return {
         "busy": SYNC_LOCK.locked(),
         "dirty_count": len(dirty),
         "dirty": dirty,
         "history": history,
+        "catalog": catalog_meta,
         "xml": xml_meta,
         "image_field": HOROSHOP_SETTINGS.image_field if HOROSHOP_SETTINGS else "",
         "import_mode": "replace" if HOROSHOP_SETTINGS and HOROSHOP_SETTINGS.override else "append",
@@ -773,8 +921,14 @@ def render_page() -> str:
         </label>
       </div>
       <div class="toolbar">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:700;">
+          <input id="freshCatalog" type="checkbox" style="width:auto;">
+          Зробити свіжий експорт каталогу перед запуском
+        </label>
+        <button id="refreshCatalogButton" class="secondary" type="button">Згенерувати експорт каталогу</button>
         <button id="syncExcelButton" type="button">Оновити артикули з Excel</button>
       </div>
+      <div id="catalogStatus" class="muted">Каталог Хорошопа ще не завантажено.</div>
       <div class="muted">В Excel читається перший стовпець першого аркуша: артикул для відображення на сайті.</div>
     </section>
     <div class="grid">
@@ -804,6 +958,8 @@ def render_page() -> str:
     const shopLogin = document.getElementById('shopLogin');
     const shopPassword = document.getElementById('shopPassword');
     const excelFile = document.getElementById('excelFile');
+    const freshCatalog = document.getElementById('freshCatalog');
+    const catalogStatus = document.getElementById('catalogStatus');
     const buttons = [
       'refreshButton', 'rebuildButton', 'syncDirtyButton', 'syncAllButton'
     ].map((id) => document.getElementById(id));
@@ -850,7 +1006,24 @@ def render_page() -> str:
       const data = new FormData();
       data.append('login', login);
       data.append('password', password);
+      data.append('fresh_catalog', freshCatalog.checked ? '1' : '0');
       return data;
+    }}
+
+    function requireFullUpdateCredentials() {{
+      const login = shopLogin.value.trim();
+      const password = shopPassword.value;
+      if (!login || !password) {{
+        throw new Error('Введіть логін і пароль Хорошопа.');
+      }}
+      const repeatedLogin = window.prompt('Повторно введіть логін Хорошопа для повного оновлення:') || '';
+      if (repeatedLogin.trim() !== login) {{
+        throw new Error('Повторний логін не збігається. Повне оновлення скасовано.');
+      }}
+      const repeatedPassword = window.prompt('Повторно введіть пароль Хорошопа для повного оновлення:') || '';
+      if (repeatedPassword !== password) {{
+        throw new Error('Повторний пароль не збігається. Повне оновлення скасовано.');
+      }}
     }}
 
     function renderTable(target, rows) {{
@@ -903,6 +1076,11 @@ def render_page() -> str:
       renderTable(dirtyTable, state.dirty || []);
       renderTable(historyTable, state.history || []);
       const xml = state.xml || {{}};
+      const catalog = state.catalog || {{}};
+      catalogStatus.textContent = catalog.has_cache
+        ? 'Кеш каталогу Хорошопа: ' + (catalog.products_count || 0) +
+          ' товарів, оновлено ' + (catalog.updated_at || '-')
+        : 'Кеш каталогу Хорошопа ще не створено. Перед першим оновленням буде виконано свіжий експорт.';
       statusBox.textContent =
         'XML: ' + (xml.path || '-') + '\\n' +
         'Оновлено: ' + (xml.updated_at || '-') + '\\n' +
@@ -960,6 +1138,7 @@ def render_page() -> str:
         return;
       }}
       try {{
+        requireFullUpdateCredentials();
         const result = await api('/api/sync/all', {{ method: 'POST', body: credentialFormData() }});
         pollJob(result.job_id);
       }} catch (error) {{
@@ -972,6 +1151,18 @@ def render_page() -> str:
         const data = credentialFormData();
         data.append('file', excelFile.files[0], excelFile.files[0].name);
         const result = await api('/api/sync/excel', {{
+          method: 'POST',
+          body: data
+        }});
+        pollJob(result.job_id);
+      }} catch (error) {{
+        statusBox.textContent = error.message;
+      }}
+    }});
+    document.getElementById('refreshCatalogButton').addEventListener('click', async () => {{
+      try {{
+        const data = credentialFormData();
+        const result = await api('/api/catalog/refresh', {{
           method: 'POST',
           body: data
         }});
