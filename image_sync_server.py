@@ -925,10 +925,10 @@ def render_page() -> str:
           <input id="freshCatalog" type="checkbox" style="width:auto;">
           Зробити свіжий експорт каталогу перед запуском
         </label>
-        <button id="refreshCatalogButton" class="secondary" type="button">Згенерувати експорт каталогу</button>
+        <button id="refreshCatalogButton" class="secondary" type="button">Згенерувати імпорт сайту</button>
         <button id="syncExcelButton" type="button">Оновити артикули з Excel</button>
       </div>
-      <div id="catalogStatus" class="muted">Каталог Хорошопа ще не завантажено.</div>
+      <div id="catalogStatus" class="muted">Імпорт сайту ще не завантажено.</div>
       <div class="muted">В Excel читається перший стовпець першого аркуша: артикул для відображення на сайті.</div>
     </section>
     <div class="grid">
@@ -961,7 +961,8 @@ def render_page() -> str:
     const freshCatalog = document.getElementById('freshCatalog');
     const catalogStatus = document.getElementById('catalogStatus');
     const buttons = [
-      'refreshButton', 'rebuildButton', 'syncDirtyButton', 'syncAllButton'
+      'refreshButton', 'rebuildButton', 'syncDirtyButton', 'syncAllButton',
+      'refreshCatalogButton', 'syncExcelButton'
     ].map((id) => document.getElementById(id));
     let activeJob = '';
 
@@ -1078,9 +1079,9 @@ def render_page() -> str:
       const xml = state.xml || {{}};
       const catalog = state.catalog || {{}};
       catalogStatus.textContent = catalog.has_cache
-        ? 'Кеш каталогу Хорошопа: ' + (catalog.products_count || 0) +
+        ? 'Імпорт сайту: ' + (catalog.products_count || 0) +
           ' товарів, оновлено ' + (catalog.updated_at || '-')
-        : 'Кеш каталогу Хорошопа ще не створено. Перед першим оновленням буде виконано свіжий експорт.';
+        : 'Імпорт сайту ще не створено. Перед першим оновленням буде виконано свіжий експорт каталогу.';
       statusBox.textContent =
         'XML: ' + (xml.path || '-') + '\\n' +
         'Оновлено: ' + (xml.updated_at || '-') + '\\n' +
