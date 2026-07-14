@@ -83,6 +83,24 @@ class CatalogCacheTests(unittest.TestCase):
         self.assertEqual(state.history[-1]["article"], "X33")
         self.assertEqual(state.history[-1]["status"], "skipped")
 
+    def test_skip_all_dirty_moves_queue_to_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = SyncState(Path(temp_dir) / "state.json")
+            state.mark_dirty("X33", "manual", 2)
+            state.mark_dirty("X34", "manual", 1)
+
+            moved = state.skip_all_dirty()
+
+        self.assertEqual(moved, 2)
+        self.assertEqual(state.dirty, {})
+        self.assertEqual(
+            [item["article"] for item in state.history],
+            ["X33", "X34"],
+        )
+        self.assertTrue(
+            all(item["status"] == "skipped" for item in state.history)
+        )
+
     def test_archive_history_moves_current_history_to_archive(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state = SyncState(Path(temp_dir) / "state.json")

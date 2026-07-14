@@ -224,6 +224,24 @@ class SyncState:
     def clear_dirty(self) -> None:
         self.dirty.clear()
 
+    def skip_all_dirty(self) -> int:
+        if not self.dirty:
+            return 0
+        moved = 0
+        for article in sorted(list(self.dirty), key=str.casefold):
+            item = dict(self.dirty.pop(article))
+            item.update(
+                {
+                    "updated_at": timestamp(),
+                    "status": "skipped",
+                    "message": "Пропущено разом з усією чергою.",
+                }
+            )
+            self.history.append(item)
+            moved += 1
+        self.history = self.history[-STATE_HISTORY_LIMIT:]
+        return moved
+
     def skip_dirty(self, article: str) -> bool:
         article = normalize_article(article)
         if not article or article not in self.dirty:
@@ -1421,7 +1439,14 @@ def render_page() -> str:
       <button id="syncAllButton" class="danger" type="button">Повне оновлення</button>
     </details>
     <section>
-      <h2>Черга змін</h2>
+      <div class="section-heading">
+        <h2>Черга змін</h2>
+        <div class="toolbar">
+          <button id="syncQueueButton" type="button">Оновити всі</button>
+          <button id="skipQueueButton" class="secondary" type="button">Пропустити всі</button>
+          <button id="deleteQueueButton" class="danger" type="button">Видалити чергу</button>
+        </div>
+      </div>
       <div id="dirtyTable" class="table-wrap"><div class="empty">Завантаження...</div></div>
     </section>
     <section>
@@ -1464,7 +1489,8 @@ def render_page() -> str:
     const buttons = [
       'refreshButton', 'rebuildButton', 'syncDirtyButton', 'syncAllButton',
       'previewDirtyButton', 'refreshCatalogButton', 'previewExcelButton',
-      'syncExcelButton', 'manualAddButton', 'archiveHistoryButton', 'archiveHistoryInlineButton'
+      'syncExcelButton', 'manualAddButton', 'syncQueueButton', 'skipQueueButton',
+      'deleteQueueButton', 'archiveHistoryButton', 'archiveHistoryInlineButton'
     ].map((id) => document.getElementById(id));
     let activeJob = '';
 
@@ -1762,14 +1788,17 @@ def render_page() -> str:
         statusBox.textContent = error.message;
       }}
     }});
-    document.getElementById('syncDirtyButton').addEventListener('click', async () => {{
+    async function syncDirtyQueue() {{
       try {{
         const result = await api('/api/sync/dirty', {{ method: 'POST', body: credentialFormData() }});
         pollJob(result.job_id);
       }} catch (error) {{
         statusBox.textContent = error.message;
       }}
-    }});
+    }}
+
+    document.getElementById('syncDirtyButton').addEventListener('click', syncDirtyQueue);
+    document.getElementById('syncQueueButton').addEventListener('click', syncDirtyQueue);
     document.getElementById('syncAllButton').addEventListener('click', async () => {{
       const warning = [
         'Повне оновлення пройде по всіх артикулах із XML.',
@@ -1831,6 +1860,30 @@ def render_page() -> str:
         statusBox.textContent = error.message;
       }}
     }});
+
+    document.getElementById('skipQueueButton').addEventListener('click', async () => {{
+      if (!window.confirm('Пропустити всі артикули з черги? Вони перейдуть в останні події зі статусом skipped.')) return;
+      try {{
+        const result = await api('/api/dirty/skip-all', {{ method: 'POST' }});
+        statusBox.textContent = 'Пропущено артикулів: ' + (result.skipped || 0);
+        await refreshState();
+      }} catch (error) {{
+        statusBox.textContent = error.message;
+      }}
+    }});
+
+    document.getElementById('deleteQueueButton').addEventListener('click', async () => {{
+      if (!window.confirm('Видалити всю чергу без сліду? Це корисно, якщо випадково вибрали не той Excel-файл.')) return;
+      try {{
+        await api('/api/clear-dirty', {{ method: 'POST' }});
+        renderOperationReport(null);
+        statusBox.textContent = 'Чергу видалено без запису в історію.';
+        await refreshState();
+      }} catch (error) {{
+        statusBox.textContent = error.message;
+      }}
+    }});
+
     async function archiveHistory() {{
       try {{
         const result = await api('/api/history/archive', {{ method: 'POST' }});
@@ -2078,6 +2131,16 @@ async def api_mark_dirty_manual(request: Request) -> dict[str, Any]:
         return add_manual_dirty_article(str(form.get("article", "")))
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.post("/api/dirty/skip-all")
+def api_skip_all_dirty(request: Request) -> dict[str, Any]:
+    protected_json(request)
+    with STATE_LOCK:
+        state = get_state()
+        skipped = state.skip_all_dirty()
+        state.save()
+    return {"ok": True, "skipped": skipped}
 
 
 @app.post("/api/dirty/{article}")
