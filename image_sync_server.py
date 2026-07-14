@@ -200,6 +200,22 @@ class SyncState:
     def clear_dirty(self) -> None:
         self.dirty.clear()
 
+    def skip_dirty(self, article: str) -> bool:
+        article = normalize_article(article)
+        if not article or article not in self.dirty:
+            return False
+        item = dict(self.dirty.pop(article))
+        item.update(
+            {
+                "updated_at": timestamp(),
+                "status": "skipped",
+                "message": "Пропущено вручну.",
+            }
+        )
+        self.history.append(item)
+        self.history = self.history[-STATE_HISTORY_LIMIT:]
+        return True
+
     def set_catalog_products(self, products: list[dict[str, Any]]) -> None:
         self.catalog_products = [
             item for item in products if isinstance(item, dict)
@@ -1331,7 +1347,10 @@ def render_page() -> str:
           '<td>' + escapeHtml(row.image_count ?? '') + '</td>' +
           '<td>' + escapeHtml(row.updated_at || row.first_seen_at || '') + '</td>' +
           '<td>' + escapeHtml(row.message || '') + '</td>' +
-          '<td><button class="small article-sync" type="button" data-article="' + article + '">Оновити</button></td>' +
+          '<td><div class="toolbar">' +
+          '<button class="small article-sync" type="button" data-article="' + article + '">Оновити</button>' +
+          '<button class="small secondary article-skip" type="button" data-article="' + article + '">Пропустити</button>' +
+          '</div></td>' +
           '</tr>';
       }}
       markup += '</tbody></table>';
@@ -1346,6 +1365,19 @@ def render_page() -> str:
               body: data
             }});
             pollJob(result.job_id);
+          }} catch (error) {{
+            statusBox.textContent = error.message;
+          }}
+        }});
+      }});
+      target.querySelectorAll('.article-skip').forEach((button) => {{
+        button.addEventListener('click', async () => {{
+          try {{
+            const article = button.getAttribute('data-article') || '';
+            await api('/api/dirty/' + encodeURIComponent(article) + '/skip', {{
+              method: 'POST'
+            }});
+            await refreshState();
           }} catch (error) {{
             statusBox.textContent = error.message;
           }}
@@ -1731,6 +1763,18 @@ def api_mark_dirty(article: str, request: Request) -> dict[str, Any]:
             xml_products = {}
         state.mark_dirty(article, "manual", len(xml_products.get(article, [])))
         state.save()
+    return {"ok": True}
+
+
+@app.post("/api/dirty/{article}/skip")
+def api_skip_dirty(article: str, request: Request) -> dict[str, Any]:
+    protected_json(request)
+    with STATE_LOCK:
+        state = get_state()
+        skipped = state.skip_dirty(article)
+        state.save()
+    if not skipped:
+        raise HTTPException(status_code=404, detail="Артикул не знайдено в черзі.")
     return {"ok": True}
 
 

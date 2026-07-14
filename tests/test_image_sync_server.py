@@ -55,6 +55,17 @@ class ExcelArticleTests(unittest.TestCase):
 
 
 class CatalogCacheTests(unittest.TestCase):
+    def test_skip_dirty_moves_article_to_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = SyncState(Path(temp_dir) / "state.json")
+            state.mark_dirty("X33", "manual", 2)
+
+            self.assertTrue(state.skip_dirty("X33"))
+
+        self.assertNotIn("X33", state.dirty)
+        self.assertEqual(state.history[-1]["article"], "X33")
+        self.assertEqual(state.history[-1]["status"], "skipped")
+
     def test_state_persists_catalog_cache(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             state_file = Path(temp_dir) / "state.json"
