@@ -840,6 +840,7 @@ def render_page() -> str:
       background: var(--panel);
     }}
     .fields {{ display: grid; grid-template-columns: repeat(3, minmax(180px, 1fr)); gap: 10px; }}
+    .file-action {{ display: grid; grid-template-columns: minmax(180px, 1fr) auto; gap: 10px; align-items: end; }}
     label {{ display: grid; gap: 6px; font-weight: 700; color: #334155; }}
     input {{
       width: 100%;
@@ -890,6 +891,7 @@ def render_page() -> str:
       main {{ padding: 16px; }}
       .grid {{ grid-template-columns: 1fr; }}
       .fields {{ grid-template-columns: 1fr; }}
+      .file-action {{ grid-template-columns: 1fr; }}
       button {{ width: 100%; }}
     }}
   </style>
@@ -916,9 +918,12 @@ def render_page() -> str:
         <label>Пароль Хорошоп
           <input id="shopPassword" type="password" autocomplete="current-password">
         </label>
-        <label>Excel зі списком артикулів
-          <input id="excelFile" type="file" accept=".xlsx,.xlsm">
-        </label>
+        <div class="file-action">
+          <label>Excel зі списком артикулів
+            <input id="excelFile" type="file" accept=".xlsx,.xlsm">
+          </label>
+          <button id="syncExcelButton" type="button">Оновити артикули з Excel</button>
+        </div>
       </div>
       <div class="toolbar">
         <label style="display:flex;align-items:center;gap:8px;font-weight:700;">
@@ -926,7 +931,6 @@ def render_page() -> str:
           Зробити свіжий експорт каталогу перед запуском
         </label>
         <button id="refreshCatalogButton" class="secondary" type="button">Згенерувати імпорт сайту</button>
-        <button id="syncExcelButton" type="button">Оновити артикули з Excel</button>
       </div>
       <div id="catalogStatus" class="muted">Імпорт сайту ще не завантажено.</div>
       <div class="muted">В Excel читається перший стовпець першого аркуша: артикул для відображення на сайті.</div>
