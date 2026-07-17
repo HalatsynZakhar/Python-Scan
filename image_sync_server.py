@@ -17,7 +17,8 @@ import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -596,6 +597,32 @@ def parse_excel_articles(data: bytes) -> list[XmlRequest]:
         return unique_xml_requests(values)
     finally:
         workbook.close()
+
+
+def build_excel_template() -> bytes:
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Імпорт"
+    worksheet.append(["Артикул", "Бренд"])
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = "A1:B1"
+    worksheet.column_dimensions["A"].width = 24
+    worksheet.column_dimensions["B"].width = 32
+
+    header_fill = PatternFill("solid", fgColor="166534")
+    for cell in worksheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center")
+
+    for row in range(2, 102):
+        worksheet.cell(row=row, column=1)
+        worksheet.cell(row=row, column=2)
+
+    output = io.BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
 
 
 def load_or_refresh_catalog(
@@ -1442,9 +1469,35 @@ def render_page() -> str:
       border-radius: 8px;
       background: var(--panel);
     }}
+    .panel-title {{ margin: 0; font-size: 17px; letter-spacing: 0; }}
+    .panel-description {{ margin: 2px 0 0; color: var(--muted); font-size: 14px; }}
     .fields {{ display: grid; grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr); gap: 10px; }}
     .excel-block {{ display: grid; gap: 10px; }}
     .file-action {{ display: grid; grid-template-columns: minmax(280px, 1fr) auto auto; gap: 10px; align-items: stretch; }}
+    .template-link {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      border: 1px solid #94a3b8;
+      border-radius: 6px;
+      padding: 9px 12px;
+      background: #fff;
+      color: #334155;
+      font-weight: 700;
+      text-decoration: none;
+    }}
+    .template-link:hover {{ border-color: var(--focus); color: #1d4ed8; background: #eff6ff; }}
+    .column-guide {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+    .column-guide span {{
+      border: 1px solid #bfdbfe;
+      border-radius: 6px;
+      padding: 7px 9px;
+      background: #eff6ff;
+      color: #1e3a8a;
+      font-size: 13px;
+      font-weight: 700;
+    }}
     .excel-dropzone {{
       position: relative;
       display: grid;
@@ -1494,7 +1547,8 @@ def render_page() -> str:
     }}
     .excel-dropzone.has-file .detach-excel {{ display: inline-grid; place-items: center; }}
     .detach-excel:hover {{ background: var(--bad); }}
-    .manual-action {{ display: grid; grid-template-columns: minmax(180px, 360px) auto 1fr; gap: 10px; align-items: end; }}
+    .manual-action {{ display: grid; grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) auto; gap: 10px; align-items: end; }}
+    .manual-hint {{ grid-column: 1 / -1; }}
     label {{ display: grid; gap: 6px; font-weight: 700; color: #334155; }}
     input {{
       width: 100%;
@@ -1608,6 +1662,10 @@ def render_page() -> str:
   </header>
   <main>
     <section class="panel">
+      <div>
+        <h2 class="panel-title">Доступ до Хорошоп</h2>
+        <p class="panel-description">Дані потрібні лише під час перевірки або оновлення.</p>
+      </div>
       <div class="fields">
         <label>Логін Хорошоп
           <input id="shopLogin" autocomplete="username" placeholder="api@example.com">
@@ -1615,6 +1673,22 @@ def render_page() -> str:
         <label>Пароль Хорошоп
           <input id="shopPassword" type="password" autocomplete="current-password">
         </label>
+      </div>
+      <div id="credentialNotice" class="notice notice-warning is-hidden">
+        Введіть логін і пароль Хорошопа перед перевіркою, експортом або оновленням.
+      </div>
+    </section>
+    <section class="panel">
+      <div class="section-heading">
+        <div>
+          <h2 class="panel-title">Excel-імпорт</h2>
+          <p class="panel-description">Додайте потрібні артикули до черги або оновіть їх одразу.</p>
+        </div>
+        <a class="template-link" href="/api/excel-template" download="horoshop_import_template.xlsx">Завантажити шаблон</a>
+      </div>
+      <div class="column-guide">
+        <span>1. Артикул</span>
+        <span>2. Бренд (необов'язково)</span>
       </div>
       <div class="excel-block">
         <div class="file-action">
@@ -1628,8 +1702,12 @@ def render_page() -> str:
           <button id="syncExcelButton" type="button">Оновити артикули з Excel</button>
         </div>
       </div>
-      <div id="credentialNotice" class="notice notice-warning is-hidden">
-        Введіть логін і пароль Хорошопа перед перевіркою, експортом або оновленням.
+      <div class="muted">Порожній бренд не обробляється як brand=&quot;&quot;: буде використано перший варіант артикула з XML.</div>
+    </section>
+    <section class="panel">
+      <div>
+        <h2 class="panel-title">Ручне додавання</h2>
+        <p class="panel-description">Для одиничного товару або швидкої перевірки.</p>
       </div>
       <div class="manual-action">
         <label>Додати артикул у чергу вручну
@@ -1639,8 +1717,10 @@ def render_page() -> str:
           <input id="manualBrand" autocomplete="off" placeholder="Наприклад: BRUDER">
         </label>
         <button id="manualAddButton" class="secondary" type="button">Перевірити і додати</button>
-        <div id="manualAddHint" class="muted">Порожній бренд не фільтрує: буде використано перший варіант артикула з XML.</div>
+        <div id="manualAddHint" class="muted manual-hint">Порожній бренд не фільтрує: буде використано перший варіант артикула з XML.</div>
       </div>
+    </section>
+    <section class="panel">
       <div class="toolbar">
         <label style="display:flex;align-items:center;gap:8px;font-weight:700;">
           <input id="freshCatalog" type="checkbox" style="width:auto;">
@@ -1653,7 +1733,7 @@ def render_page() -> str:
         <div class="muted">Останнє оновлення: <strong id="catalogUpdatedAt">-</strong></div>
         <div class="muted">Локальний файл: <span id="catalogLocalPath">-</span></div>
       </div>
-      <div class="muted">Excel читає перший стовпець як артикул, другий — як бренд. Порожній бренд не обробляється як brand=&quot;&quot;, а бере перший варіант артикула з XML. Для заповненого бренду спочатку шукається точний збіг, потім збіг без урахування регістру; якщо варіанту немає, буде показано доступні бренди.</div>
+      <div class="muted">Для заповненого бренду спочатку шукається точний збіг, потім збіг без урахування регістру; якщо варіанту немає, буде показано доступні бренди.</div>
     </section>
     <div class="grid">
       <div class="metric"><span>Змінені артикули</span><strong id="dirtyCount">0</strong></div>
@@ -2293,6 +2373,21 @@ def public_status() -> dict[str, Any]:
 def api_state(request: Request) -> dict[str, Any]:
     protected_json(request)
     return state_snapshot()
+
+
+@app.get("/api/excel-template")
+def api_excel_template() -> Response:
+    return Response(
+        content=build_excel_template(),
+        media_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="horoshop_import_template.xlsx"'
+            )
+        },
+    )
 
 
 @app.post("/api/rebuild")

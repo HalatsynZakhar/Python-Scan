@@ -3,12 +3,13 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from image_sync_server import (
     LOCAL_DATA_DIR,
     SyncState,
     add_manual_dirty_article,
+    build_excel_template,
     catalog_age_seconds,
     load_or_refresh_catalog,
     load_server_settings,
@@ -57,6 +58,18 @@ class ServerSettingsTests(unittest.TestCase):
 
 
 class ExcelArticleTests(unittest.TestCase):
+    def test_excel_template_has_article_and_brand_columns(self):
+        workbook = load_workbook(BytesIO(build_excel_template()), read_only=True)
+        try:
+            worksheet = workbook.worksheets[0]
+            self.assertEqual(worksheet.title, "Імпорт")
+            self.assertEqual(
+                next(worksheet.iter_rows(max_row=1, values_only=True)),
+                ("Артикул", "Бренд"),
+            )
+        finally:
+            workbook.close()
+
     def test_reads_first_two_columns_as_article_and_brand(self):
         workbook = Workbook()
         worksheet = workbook.active
