@@ -84,6 +84,7 @@ class ReliableClock:
 RELIABLE_CLOCK: ReliableClock | None = None
 CLOCK_SOURCE = "system"
 CLOCK_WARNING: str | None = None
+LAST_MISSING_MAIN_GROUPS: frozenset[tuple[str, str]] | None = None
 
 
 def query_ntp_time(server: str, timeout: float = 3.0) -> float:
@@ -408,15 +409,30 @@ def build_xml(config: dict[str, Any]) -> tuple[int, int]:
     valid_products: dict[
         tuple[str, str], list[tuple[tuple[int, int | str], str]]
     ] = {}
+    missing_main_groups: set[tuple[str, str]] = set()
     for (article, brand), images in products.items():
         if not any(sort_key == (0, 0) for sort_key, _ in images):
-            location = brand or "/"
-            log(
-                "Пропущено групу фото без ключового зображення: "
-                f"артикул={article}, папка={location}"
-            )
+            missing_main_groups.add((article, brand))
             continue
         valid_products[(article, brand)] = images
+
+    global LAST_MISSING_MAIN_GROUPS
+    current_missing_groups = frozenset(missing_main_groups)
+    if current_missing_groups != LAST_MISSING_MAIN_GROUPS:
+        if current_missing_groups:
+            examples = ", ".join(
+                f"{article} ({brand or '/'})"
+                for article, brand in sorted(current_missing_groups)[:5]
+            )
+            extra = len(current_missing_groups) - 5
+            suffix = f"; ще {extra}" if extra > 0 else ""
+            log(
+                "Пропущено груп без ключового зображення: "
+                f"{len(current_missing_groups)} | приклади: {examples}{suffix}"
+            )
+        elif LAST_MISSING_MAIN_GROUPS:
+            log("Усі групи фото тепер мають ключове зображення.")
+        LAST_MISSING_MAIN_GROUPS = current_missing_groups
 
     product_count = len(valid_products)
     image_count = sum(len(images) for images in valid_products.values())
@@ -529,14 +545,6 @@ class ImagesChangeHandler(FileSystemEventHandler):
             return
 
         try:
-            event_type = EVENT_TYPE_LABELS.get(
-                event.event_type,
-                event.event_type,
-            )
-            log(
-                f"Зміна файлів: {event_type} | "
-                + " -> ".join(paths)
-            )
             build_xml(self.config)
         except Exception as error:
             log(f"Помилка оновлення XML: {error}")

@@ -840,11 +840,6 @@ class SyncChangeHandler(FileSystemEventHandler):
 
         try:
             event_type = EVENT_TYPE_LABELS.get(event.event_type, event.event_type)
-            paths = [event.src_path]
-            destination = getattr(event, "dest_path", "")
-            if destination:
-                paths.append(destination)
-            log(f"Зміна файлів: {event_type} | " + " -> ".join(paths))
             build_xml(self.config)
             xml_products = load_xml_products(self.config["output_xml"])
             counts = image_counts(xml_products)

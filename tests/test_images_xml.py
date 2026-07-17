@@ -128,6 +128,41 @@ class BuildXmlTests(unittest.TestCase):
             self.assertNotIn(("01063", "OTHER"), found)
             self.assertIn(("ROOT", ""), found)
 
+    def test_logs_missing_main_groups_once_as_a_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "images"
+            output = root / "out" / "products.xml"
+            (images / "A").mkdir(parents=True)
+            (images / "B").mkdir()
+            (images / "A" / "X_1.jpg").touch()
+            (images / "B" / "Y_1.jpg").touch()
+
+            original_missing_groups = images_xml.LAST_MISSING_MAIN_GROUPS
+            images_xml.LAST_MISSING_MAIN_GROUPS = None
+            try:
+                with patch("images_xml.log") as mocked_log:
+                    config = {
+                        "images_dir": images,
+                        "output_xml": output,
+                        "base_url": "https://img.example.com/foto",
+                        "allowed_extensions": {".jpg"},
+                    }
+                    build_xml(config)
+                    build_xml(config)
+            finally:
+                images_xml.LAST_MISSING_MAIN_GROUPS = original_missing_groups
+
+        warnings = [
+            str(call.args[0])
+            for call in mocked_log.call_args_list
+            if str(call.args[0]).startswith("Пропущено груп без")
+        ]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("2", warnings[0])
+        self.assertIn("X (A)", warnings[0])
+        self.assertIn("Y (B)", warnings[0])
+
 
 class LoggingTests(unittest.TestCase):
     def tearDown(self):
