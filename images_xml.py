@@ -383,9 +383,9 @@ def build_xml(config: dict[str, Any]) -> tuple[int, int]:
             f"Папку із зображеннями не знайдено: {images_dir}"
         )
 
-    products: dict[str, list[tuple[tuple[int, int | str], str]]] = defaultdict(
-        list
-    )
+    products: dict[
+        tuple[str, str], list[tuple[tuple[int, int | str], str]]
+    ] = defaultdict(list)
 
     for file_path in images_dir.rglob("*"):
         if not file_path.is_file():
@@ -399,11 +399,27 @@ def build_xml(config: dict[str, Any]) -> tuple[int, int]:
             continue
 
         relative_path = file_path.relative_to(images_dir).as_posix()
+        brand = file_path.relative_to(images_dir).parent.as_posix()
+        if brand == ".":
+            brand = ""
         image_url = f"{images_base_url}/{quote(relative_path, safe='/')}"
-        products[article].append((sort_key, image_url))
+        products[(article, brand)].append((sort_key, image_url))
 
-    product_count = len(products)
-    image_count = sum(len(images) for images in products.values())
+    valid_products: dict[
+        tuple[str, str], list[tuple[tuple[int, int | str], str]]
+    ] = {}
+    for (article, brand), images in products.items():
+        if not any(sort_key == (0, 0) for sort_key, _ in images):
+            location = brand or "/"
+            log(
+                "Пропущено групу фото без ключового зображення: "
+                f"артикул={article}, папка={location}"
+            )
+            continue
+        valid_products[(article, brand)] = images
+
+    product_count = len(valid_products)
+    image_count = sum(len(images) for images in valid_products.values())
     generated_at = now_kyiv()
     generated_at_text = generated_at.isoformat(timespec="seconds")
 
@@ -421,10 +437,18 @@ def build_xml(config: dict[str, Any]) -> tuple[int, int]:
         )
     )
 
-    for article in sorted(products, key=str.casefold):
-        product_element = ET.SubElement(root, "product", article=article)
+    for article, brand in sorted(
+        valid_products,
+        key=lambda item: (item[0].casefold(), item[1].casefold(), item[0], item[1]),
+    ):
+        product_element = ET.SubElement(
+            root,
+            "product",
+            article=article,
+            brand=brand,
+        )
         for _, image_url in sorted(
-            products[article], key=lambda item: item[0]
+            valid_products[(article, brand)], key=lambda item: item[0]
         ):
             ET.SubElement(product_element, "image").text = image_url
 

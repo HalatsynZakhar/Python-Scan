@@ -14,6 +14,7 @@ from horoshop_sync import (
     load_horoshop_settings,
     load_xml_products,
     with_runtime_credentials,
+    XmlProduct,
 )
 
 
@@ -243,13 +244,34 @@ class XmlProductTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             xml_file = Path(temp_dir) / "images.xml"
             root = ET.Element("products")
+            product = ET.SubElement(root, "product", article="X36B", brand="BRUDER")
+            ET.SubElement(product, "image").text = "https://img.example.com/X36B.jpg"
+            ET.ElementTree(root).write(xml_file, encoding="utf-8", xml_declaration=True)
+
+            products = load_xml_products(xml_file)
+
+        self.assertEqual(
+            products,
+            [
+                XmlProduct(
+                    article="X36B",
+                    brand="BRUDER",
+                    image_urls=("https://img.example.com/X36B.jpg",),
+                )
+            ],
+        )
+
+    def test_missing_brand_attribute_defaults_to_empty_string(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            xml_file = Path(temp_dir) / "images.xml"
+            root = ET.Element("products")
             product = ET.SubElement(root, "product", article="X36B")
             ET.SubElement(product, "image").text = "https://img.example.com/X36B.jpg"
             ET.ElementTree(root).write(xml_file, encoding="utf-8", xml_declaration=True)
 
             products = load_xml_products(xml_file)
 
-        self.assertEqual(products, {"X36B": ["https://img.example.com/X36B.jpg"]})
+        self.assertEqual(products[0].brand, "")
 
 
 if __name__ == "__main__":

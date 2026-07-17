@@ -16,8 +16,9 @@ from image_sync_server import (
     prepare_import_plan,
     queue_preview_articles,
     validate_image_url,
+    XmlRequest,
 )
-from horoshop_sync import CatalogIndex, HoroshopSettings
+from horoshop_sync import CatalogIndex, HoroshopSettings, XmlProduct
 
 
 class ServerSettingsTests(unittest.TestCase):
@@ -56,7 +57,7 @@ class ServerSettingsTests(unittest.TestCase):
 
 
 class ExcelArticleTests(unittest.TestCase):
-    def test_reads_first_column_unique_articles(self):
+    def test_reads_article_and_optional_brand(self):
         workbook = Workbook()
         worksheet = workbook.active
         worksheet.append(["Артикул", "Назва"])
@@ -68,7 +69,25 @@ class ExcelArticleTests(unittest.TestCase):
         workbook.save(buffer)
         workbook.close()
 
-        self.assertEqual(parse_excel_articles(buffer.getvalue()), ["X33", "X34"])
+        self.assertEqual(
+            parse_excel_articles(buffer.getvalue()),
+            [XmlRequest("X33", ""), XmlRequest("X34", "")],
+        )
+
+    def test_reads_brand_only_from_named_brand_column(self):
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["Article", "Brand"])
+        worksheet.append(["X33", "BRUDER"])
+        worksheet.append(["X33", "bruder"])
+        buffer = BytesIO()
+        workbook.save(buffer)
+        workbook.close()
+
+        self.assertEqual(
+            parse_excel_articles(buffer.getvalue()),
+            [XmlRequest("X33", "BRUDER")],
+        )
 
 
 class CatalogCacheTests(unittest.TestCase):
@@ -339,14 +358,52 @@ class PreviewAndValidationTests(unittest.TestCase):
         plan = prepare_import_plan(
             settings=settings,
             catalog=catalog,
-            xml_products={"DISPLAY": ["https://img.example.com/DISPLAY.jpg"]},
-            target_articles=["DISPLAY", "MISSING"],
+            xml_products=[
+                XmlProduct(
+                    article="DISPLAY",
+                    brand="",
+                    image_urls=("https://img.example.com/DISPLAY.jpg",),
+                )
+            ],
+            target_articles=[XmlRequest("DISPLAY"), XmlRequest("MISSING")],
         )
 
         self.assertEqual(len(plan["prepared"]), 1)
         self.assertEqual(plan["prepared"][0]["remote_article"], "REAL")
         self.assertEqual(len(plan["skipped"]), 1)
         self.assertEqual(plan["preview"][0]["sample_images"], ["https://img.example.com/DISPLAY.jpg"])
+
+    def test_prepare_import_plan_matches_brand_exact_then_case_insensitive(self):
+        settings = HoroshopSettings(domain="https://shop.example.com", token="token")
+        catalog = CatalogIndex.from_raw([{"article": "X33"}])
+        products = [
+            XmlProduct("X33", "ALPHA", ("https://img.example.com/a.jpg",)),
+            XmlProduct("X33", "BRUDER", ("https://img.example.com/b.jpg",)),
+        ]
+
+        plan = prepare_import_plan(
+            settings=settings,
+            catalog=catalog,
+            xml_products=products,
+            target_articles=[XmlRequest("X33", "bruder")],
+        )
+        self.assertEqual(plan["prepared"][0]["brand"], "BRUDER")
+
+        default = prepare_import_plan(
+            settings=settings,
+            catalog=catalog,
+            xml_products=products,
+            target_articles=[XmlRequest("X33")],
+        )
+        self.assertEqual(default["prepared"][0]["brand"], "ALPHA")
+
+        missing = prepare_import_plan(
+            settings=settings,
+            catalog=catalog,
+            xml_products=products,
+            target_articles=[XmlRequest("X33", "MISSING")],
+        )
+        self.assertIn("ALPHA, BRUDER", missing["skipped"][0]["message"])
 
     def test_validate_image_url_accepts_jpeg_under_limit(self):
         class Response:

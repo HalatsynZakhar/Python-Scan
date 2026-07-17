@@ -57,6 +57,13 @@ class MatchResult:
     message: str = ""
 
 
+@dataclass(frozen=True)
+class XmlProduct:
+    article: str
+    brand: str
+    image_urls: tuple[str, ...]
+
+
 def read_raw_config(config_file: Path) -> dict[str, Any]:
     with config_file.open("r", encoding="utf-8") as file:
         data = json.load(file)
@@ -326,22 +333,28 @@ class CatalogIndex:
         return MatchResult("missing", article, message="Не знайдено в Хорошопі.")
 
 
-def load_xml_products(xml_file: Path) -> dict[str, list[str]]:
+def load_xml_products(xml_file: Path) -> list[XmlProduct]:
     if not xml_file.exists():
         raise FileNotFoundError(f"XML не знайдено: {xml_file}")
 
     root = ET.parse(xml_file).getroot()
-    result: dict[str, list[str]] = {}
+    result: list[XmlProduct] = []
     for product_element in root.findall("product"):
         article = normalize_article(product_element.attrib.get("article"))
         if not article:
             continue
-        urls = [
+        urls = tuple(
             normalize_article(image.text)
             for image in product_element.findall("image")
             if normalize_article(image.text)
-        ]
-        result[article] = urls
+        )
+        result.append(
+            XmlProduct(
+                article=article,
+                brand=str(product_element.attrib.get("brand", "")).strip(),
+                image_urls=urls,
+            )
+        )
     return result
 
 

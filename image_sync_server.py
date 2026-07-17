@@ -8,6 +8,7 @@ import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ from horoshop_sync import (
     normalize_article,
     read_raw_config,
     with_runtime_credentials,
+    XmlProduct,
 )
 from images_xml import (
     DEFAULT_CONFIG_FILE,
@@ -54,7 +56,7 @@ from images_xml import (
 )
 
 
-STATE_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
 STATE_HISTORY_LIMIT = 300
 JOB_TTL_SECONDS = 60 * 60
 CATALOG_CACHE_MAX_ITEMS = 200_000
@@ -71,6 +73,65 @@ SYNC_LOCK = threading.Lock()
 OBSERVER: Observer | None = None
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class XmlRequest:
+    article: str
+    brand: str = ""
+
+
+def normalize_brand(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def state_item_key(article: str, brand: str = "") -> str:
+    """Keep legacy article-only keys for products without a brand."""
+    article = normalize_article(article)
+    brand = normalize_brand(brand)
+    return article if not brand else f"{article}\x1f{brand}"
+
+
+def request_key(article: str, brand: str = "") -> tuple[str, str]:
+    return normalize_article(article), normalize_brand(brand)
+
+
+def format_available_brands(products: list[XmlProduct], article: str) -> str:
+    brands = []
+    seen: set[str] = set()
+    for product in products:
+        if product.article != article or product.brand in seen:
+            continue
+        seen.add(product.brand)
+        brands.append(product.brand or "(порожній бренд)")
+    return ", ".join(brands) or "немає"
+
+
+def select_xml_product(
+    xml_products: list[XmlProduct],
+    article: str,
+    brand: str = "",
+) -> tuple[XmlProduct | None, str]:
+    article = normalize_article(article)
+    brand = normalize_brand(brand)
+    candidates = [product for product in xml_products if product.article == article]
+    if not candidates:
+        return None, f"У XML не знайдено фото для артикула {article}."
+    if not brand:
+        return candidates[0], ""
+
+    for product in candidates:
+        if product.brand == brand:
+            return product, ""
+    folded_brand = brand.casefold()
+    for product in candidates:
+        if product.brand.casefold() == folded_brand:
+            return product, ""
+    return (
+        None,
+        f"Не знайдено бренд '{brand}' для артикула {article}. "
+        f"Доступні бренди: {format_available_brands(xml_products, article)}.",
+    )
 
 
 def load_server_settings(raw: dict[str, Any], xml_config: dict[str, Any]) -> dict[str, Any]:
@@ -128,11 +189,18 @@ class SyncState:
         archive = data.get("archive", [])
         catalog = data.get("catalog", {})
         if isinstance(dirty, dict):
-            self.dirty = {
-                normalize_article(article): item
-                for article, item in dirty.items()
-                if normalize_article(article) and isinstance(item, dict)
-            }
+            self.dirty = {}
+            for article, item in dirty.items():
+                if not isinstance(item, dict):
+                    continue
+                normalized_article = normalize_article(item.get("article") or article)
+                brand = normalize_brand(item.get("brand"))
+                if not normalized_article:
+                    continue
+                normalized_item = dict(item)
+                normalized_item["article"] = normalized_article
+                normalized_item["brand"] = brand
+                self.dirty[state_item_key(normalized_article, brand)] = normalized_item
         if isinstance(history, list):
             self.history = [item for item in history if isinstance(item, dict)][
                 -STATE_HISTORY_LIMIT:
@@ -174,14 +242,18 @@ class SyncState:
         event_type: str,
         image_count: int | None,
         message: str | None = None,
+        brand: str = "",
     ) -> None:
         article = normalize_article(article)
+        brand = normalize_brand(brand)
         if not article:
             return
         now = timestamp()
-        existing = self.dirty.get(article, {})
-        self.dirty[article] = {
+        key = state_item_key(article, brand)
+        existing = self.dirty.get(key, {})
+        self.dirty[key] = {
             "article": article,
+            "brand": brand,
             "first_seen_at": existing.get("first_seen_at") or now,
             "updated_at": now,
             "event_type": event_type,
@@ -200,13 +272,17 @@ class SyncState:
         remote_article: str = "",
         image_count: int | None = None,
         clear_dirty: bool = False,
+        brand: str = "",
     ) -> None:
         article = normalize_article(article)
+        brand = normalize_brand(brand)
         if not article:
             return
-        item = self.dirty.get(article, {"article": article})
+        key = state_item_key(article, brand)
+        item = self.dirty.get(key, {"article": article, "brand": brand})
         item.update(
             {
+                "brand": brand,
                 "updated_at": timestamp(),
                 "status": status,
                 "message": message,
@@ -217,9 +293,9 @@ class SyncState:
         self.history.append(dict(item))
         self.history = self.history[-STATE_HISTORY_LIMIT:]
         if clear_dirty:
-            self.dirty.pop(article, None)
+            self.dirty.pop(key, None)
         else:
-            self.dirty[article] = item
+            self.dirty[key] = item
 
     def clear_dirty(self) -> None:
         self.dirty.clear()
@@ -242,11 +318,12 @@ class SyncState:
         self.history = self.history[-STATE_HISTORY_LIMIT:]
         return moved
 
-    def skip_dirty(self, article: str) -> bool:
+    def skip_dirty(self, article: str, brand: str = "") -> bool:
         article = normalize_article(article)
-        if not article or article not in self.dirty:
+        key = state_item_key(article, brand)
+        if not article or key not in self.dirty:
             return False
-        item = dict(self.dirty.pop(article))
+        item = dict(self.dirty.pop(key))
         item.update(
             {
                 "updated_at": timestamp(),
@@ -288,12 +365,20 @@ class SyncState:
         self.history.clear()
         return moved
 
-    def archive_history_item(self, article: str, updated_at: str = "") -> bool:
+    def archive_history_item(
+        self,
+        article: str,
+        updated_at: str = "",
+        brand: str = "",
+    ) -> bool:
         article = normalize_article(article)
+        brand = normalize_brand(brand)
         if not article:
             return False
         for index, item in enumerate(self.history):
             if normalize_article(item.get("article")) != article:
+                continue
+            if normalize_brand(item.get("brand")) != brand:
                 continue
             item_updated_at = str(item.get("updated_at") or item.get("first_seen_at") or "")
             if updated_at and item_updated_at != updated_at:
@@ -346,13 +431,17 @@ def protected_json(_: Request) -> None:
     return
 
 
-def image_articles_from_event(event: FileSystemEvent, allowed_extensions: set[str]) -> set[str]:
+def image_articles_from_event(
+    event: FileSystemEvent,
+    allowed_extensions: set[str],
+    images_dir: Path,
+) -> set[XmlRequest]:
     paths = [event.src_path]
     destination = getattr(event, "dest_path", "")
     if destination:
         paths.append(destination)
 
-    articles: set[str] = set()
+    articles: set[XmlRequest] = set()
     for path in paths:
         file_path = Path(path)
         suffixes = {suffix.lower() for suffix in file_path.suffixes}
@@ -362,16 +451,24 @@ def image_articles_from_event(event: FileSystemEvent, allowed_extensions: set[st
             continue
         article, _ = parse_filename(file_path)
         if article:
-            articles.add(article)
+            try:
+                brand = file_path.relative_to(images_dir).parent.as_posix()
+            except ValueError:
+                brand = ""
+            articles.add(XmlRequest(article, "" if brand == "." else brand))
     return articles
 
 
-def image_counts(xml_products: dict[str, list[str]]) -> dict[str, int]:
-    return {article: len(urls) for article, urls in xml_products.items()}
+def image_counts(xml_products: list[XmlProduct]) -> dict[tuple[str, str], int]:
+    return {
+        request_key(product.article, product.brand): len(product.image_urls)
+        for product in xml_products
+    }
 
 
-def add_manual_dirty_article(article: str) -> dict[str, Any]:
+def add_manual_dirty_article(article: str, brand: str = "") -> dict[str, Any]:
     normalized = normalize_article(article)
+    requested_brand = normalize_brand(brand)
     if not normalized:
         raise ValueError("Введіть артикул для перевірки.")
 
@@ -381,23 +478,26 @@ def add_manual_dirty_article(article: str) -> dict[str, Any]:
     except OSError as error:
         raise ValueError(f"Не вдалося прочитати XML: {error}") from error
 
-    images = xml_products.get(normalized, [])
-    if not images:
-        raise ValueError(
-            f"У XML не знайдено фото для артикула {normalized}. "
-            "Перевірте назву файлу або папку з фото."
-        )
+    product, reason = select_xml_product(xml_products, normalized, requested_brand)
+    if product is None or not product.image_urls:
+        raise ValueError(reason or f"У XML не знайдено фото для артикула {normalized}.")
 
     with STATE_LOCK:
         state = get_state()
-        state.mark_dirty(normalized, "manual", len(images))
+        state.mark_dirty(
+            product.article,
+            "manual",
+            len(product.image_urls),
+            brand=product.brand,
+        )
         state.save()
 
     return {
         "ok": True,
-        "article": normalized,
-        "image_count": len(images),
-        "sample_images": images[:5],
+        "article": product.article,
+        "brand": product.brand,
+        "image_count": len(product.image_urls),
+        "sample_images": list(product.image_urls[:5]),
     }
 
 
@@ -405,11 +505,11 @@ def queue_preview_articles(
     *,
     plan: dict[str, Any],
     validation_failed: list[dict[str, str]],
-    counts: dict[str, int],
+    counts: dict[tuple[str, str], int],
     event_type: str,
 ) -> dict[str, Any]:
     failed_messages = {
-        normalize_article(item.get("article")): str(item.get("message", ""))
+        request_key(item.get("article"), item.get("brand")): str(item.get("message", ""))
         for item in validation_failed
     }
     queued = 0
@@ -417,16 +517,18 @@ def queue_preview_articles(
         state = get_state()
         for item in plan.get("preview", []):
             article = normalize_article(item.get("article"))
+            brand = normalize_brand(item.get("brand"))
             if not article:
                 continue
-            image_count = counts.get(article, int(item.get("image_count") or 0))
-            if article in failed_messages:
-                message = f"Перевірено через Excel. Помилка URL: {failed_messages[article]}"
+            key = request_key(article, brand)
+            image_count = counts.get(key, int(item.get("image_count") or 0))
+            if key in failed_messages:
+                message = f"Перевірено через Excel. Помилка URL: {failed_messages[key]}"
             elif item.get("status") == "ready":
                 message = "Перевірено через Excel. Можна оновити точково або разом з чергою."
             else:
                 message = f"Перевірено через Excel. {item.get('message') or 'Потрібна увага.'}"
-            state.mark_dirty(article, event_type, image_count, message=message)
+            state.mark_dirty(article, event_type, image_count, message=message, brand=brand)
             queued += 1
         state.save()
     return {"queued": queued}
@@ -449,22 +551,22 @@ def fresh_catalog_from_form(form: Any) -> bool:
     }
 
 
-def unique_articles(values: list[str]) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
+def unique_xml_requests(values: list[XmlRequest]) -> list[XmlRequest]:
+    result: list[XmlRequest] = []
+    seen: set[tuple[str, str]] = set()
     for value in values:
-        article = normalize_article(value)
+        article, brand = request_key(value.article, value.brand)
         if not article:
             continue
-        key = article.casefold()
+        key = (article.casefold(), brand.casefold())
         if key in seen:
             continue
         seen.add(key)
-        result.append(article)
+        result.append(XmlRequest(article, brand))
     return result
 
 
-def parse_excel_articles(data: bytes) -> list[str]:
+def parse_excel_articles(data: bytes) -> list[XmlRequest]:
     workbook = load_workbook(
         io.BytesIO(data),
         read_only=True,
@@ -472,7 +574,8 @@ def parse_excel_articles(data: bytes) -> list[str]:
     )
     try:
         worksheet = workbook.worksheets[0]
-        values: list[str] = []
+        values: list[XmlRequest] = []
+        brand_column_enabled = False
         for row in worksheet.iter_rows(values_only=True):
             if not row:
                 continue
@@ -488,9 +591,16 @@ def parse_excel_articles(data: bytes) -> list[str]:
                 "артикул для відображення",
                 "артикул для отображения",
             }:
+                header_brand = normalize_brand(row[1]) if len(row) > 1 else ""
+                brand_column_enabled = header_brand.casefold() in {"brand", "бренд"}
                 continue
-            values.append(text)
-        return unique_articles(values)
+            brand = (
+                normalize_brand(row[1])
+                if brand_column_enabled and len(row) > 1
+                else ""
+            )
+            values.append(XmlRequest(text, brand))
+        return unique_xml_requests(values)
     finally:
         workbook.close()
 
@@ -536,45 +646,67 @@ def catalog_age_seconds(updated_at: str) -> int | None:
 def resolve_target_articles(
     *,
     mode: str,
-    xml_products: dict[str, list[str]],
-    requested_articles: list[str] | None,
-) -> list[str]:
+    xml_products: list[XmlProduct],
+    requested_articles: list[XmlRequest] | None,
+) -> list[XmlRequest]:
     with STATE_LOCK:
-        dirty_articles = sorted(get_state().dirty, key=str.casefold)
+        dirty_articles = [
+            XmlRequest(
+                normalize_article(item.get("article")),
+                normalize_brand(item.get("brand")),
+            )
+            for item in get_state().dirty.values()
+        ]
 
     if mode == "dirty":
         target_articles = requested_articles or dirty_articles
     elif mode in {"article", "excel"}:
         target_articles = requested_articles or []
     elif mode == "all":
-        target_articles = sorted(xml_products, key=str.casefold)
+        target_articles = [
+            XmlRequest(product.article, product.brand) for product in xml_products
+        ]
     else:
         raise ValueError("Невідомий режим синхронізації.")
-    return unique_articles(target_articles)
+    return unique_xml_requests(target_articles)
 
 
 def prepare_import_plan(
     *,
     settings: HoroshopSettings,
     catalog: CatalogIndex,
-    xml_products: dict[str, list[str]],
-    target_articles: list[str],
+    xml_products: list[XmlProduct],
+    target_articles: list[XmlRequest],
 ) -> dict[str, Any]:
     prepared: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
     preview: list[dict[str, Any]] = []
 
-    for local_article in target_articles:
-        image_urls = xml_products.get(local_article, [])
+    for request in target_articles:
+        product, selection_error = select_xml_product(
+            xml_products,
+            request.article,
+            request.brand,
+        )
+        local_article = request.article
+        brand = request.brand
+        image_urls = list(product.image_urls) if product else []
+        if product is not None:
+            local_article = product.article
+            brand = product.brand
         match = catalog.match(local_article)
         item, reason = build_import_product(
             match=match,
             image_urls=image_urls,
             settings=settings,
         )
+        if product is None:
+            item = None
+            reason = selection_error
         remote_article = item["article"] if item is not None else ""
         preview_item = {
             "article": local_article,
+            "brand": brand,
             "remote_article": remote_article,
             "status": "ready" if item is not None else "skipped",
             "message": reason,
@@ -583,11 +715,12 @@ def prepare_import_plan(
         }
         preview.append(preview_item)
         if item is None:
-            skipped.append({"article": local_article, "message": reason})
+            skipped.append({"article": local_article, "brand": brand, "message": reason})
             continue
         prepared.append(
             {
                 "local_article": local_article,
+                "brand": brand,
                 "remote_article": remote_article,
                 "item": item,
                 "has_images": bool(item.get(settings.image_field, {}).get("links")),
@@ -654,7 +787,13 @@ def validate_prepared_images(
                 if len(errors) >= 3:
                     break
         if errors:
-            failed.append({"article": article, "message": " | ".join(errors)})
+            failed.append(
+                {
+                    "article": article,
+                    "brand": str(item.get("brand", "")),
+                    "message": " | ".join(errors),
+                }
+            )
         else:
             valid.append(item)
 
@@ -669,7 +808,11 @@ class SyncChangeHandler(FileSystemEventHandler):
         self._build_lock = threading.Lock()
 
     def _handle(self, event: FileSystemEvent) -> None:
-        articles = image_articles_from_event(event, self.allowed_extensions)
+        articles = image_articles_from_event(
+            event,
+            self.allowed_extensions,
+            self.config["images_dir"],
+        )
         if not articles and not event.is_directory:
             return
         if not self._build_lock.acquire(blocking=False):
@@ -686,15 +829,31 @@ class SyncChangeHandler(FileSystemEventHandler):
             xml_products = load_xml_products(self.config["output_xml"])
             counts = image_counts(xml_products)
 
-            if articles:
+            valid_articles = {
+                request
+                for request in articles
+                if request_key(request.article, request.brand) in counts
+            }
+            if valid_articles:
                 with STATE_LOCK:
                     state = get_state()
-                    for article in articles:
-                        state.mark_dirty(article, event_type, counts.get(article, 0))
+                    for request in valid_articles:
+                        state.mark_dirty(
+                            request.article,
+                            event_type,
+                            counts.get(request_key(request.article, request.brand), 0),
+                            brand=request.brand,
+                        )
                     state.save()
                 log(
                     "Зафіксовано зміни для артикулів: "
-                    + ", ".join(sorted(articles, key=str.casefold))
+                    + ", ".join(
+                        f"{request.article} [{request.brand or '-'}]"
+                        for request in sorted(
+                            valid_articles,
+                            key=lambda item: (item.article.casefold(), item.brand.casefold()),
+                        )
+                    )
                 )
         except Exception as error:
             log(f"Помилка оновлення XML/черги: {error}")
@@ -728,7 +887,7 @@ def sync_job(
     job_id: str,
     mode: str,
     credentials: dict[str, Any],
-    requested_articles: list[str] | None = None,
+    requested_articles: list[XmlRequest] | None = None,
     fresh_catalog: bool = False,
 ) -> None:
     base_settings = HOROSHOP_SETTINGS
@@ -812,9 +971,16 @@ def sync_job(
                     state = get_state()
                     state.mark_result(
                         article=skipped_item["article"],
+                        brand=str(skipped_item.get("brand", "")),
                         status="skipped",
                         message=skipped_item["message"],
-                        image_count=counts.get(skipped_item["article"], 0),
+                        image_count=counts.get(
+                            request_key(
+                                skipped_item["article"],
+                                str(skipped_item.get("brand", "")),
+                            ),
+                            0,
+                        ),
                     )
                     state.save()
 
@@ -833,9 +999,16 @@ def sync_job(
                         state = get_state()
                         state.mark_result(
                             article=failed_item["article"],
+                            brand=str(failed_item.get("brand", "")),
                             status="error",
                             message=failed_item["message"],
-                            image_count=counts.get(failed_item["article"], 0),
+                            image_count=counts.get(
+                                request_key(
+                                    failed_item["article"],
+                                    str(failed_item.get("brand", "")),
+                                ),
+                                0,
+                            ),
                         )
                         state.save()
 
@@ -902,6 +1075,7 @@ def sync_job(
             for prepared in batch:
                 remote_article = prepared["remote_article"]
                 local_article = prepared["local_article"]
+                brand = prepared["brand"]
                 article_log = logs.get(remote_article, [])
                 clear_success = (
                     True
@@ -926,10 +1100,13 @@ def sync_job(
                             state = get_state()
                             state.mark_result(
                                 article=local_article,
+                                brand=brand,
                                 status="synced",
                                 message="Зображення оновлено в Хорошопі.",
                                 remote_article=remote_article,
-                                image_count=counts.get(local_article, 0),
+                                image_count=counts.get(
+                                    request_key(local_article, brand), 0
+                                ),
                                 clear_dirty=True,
                             )
                             state.save()
@@ -940,16 +1117,21 @@ def sync_job(
                         str(entry.get("message", entry))
                         for entry in clear_logs.get(remote_article, [])
                     ) or f"Статус імпорту: {response_status}"
-                    failed.append({"article": local_article, "message": message})
+                    failed.append(
+                        {"article": local_article, "brand": brand, "message": message}
+                    )
                     if should_update_state:
                         with STATE_LOCK:
                             state = get_state()
                             state.mark_result(
                                 article=local_article,
+                                brand=brand,
                                 status="error",
                                 message=message,
                                 remote_article=remote_article,
-                                image_count=counts.get(local_article, 0),
+                                image_count=counts.get(
+                                    request_key(local_article, brand), 0
+                                ),
                             )
                             state.save()
 
@@ -992,7 +1174,7 @@ def sync_job(
 def start_sync(
     mode: str,
     credentials: dict[str, Any],
-    articles: list[str] | None = None,
+    articles: list[XmlRequest] | None = None,
     fresh_catalog: bool = False,
 ) -> dict[str, str]:
     job_id = secrets.token_hex(12)
@@ -1071,7 +1253,7 @@ def preview_job(
     job_id: str,
     mode: str,
     credentials: dict[str, Any],
-    requested_articles: list[str] | None = None,
+    requested_articles: list[XmlRequest] | None = None,
     fresh_catalog: bool = False,
 ) -> None:
     base_settings = HOROSHOP_SETTINGS
@@ -1164,7 +1346,7 @@ def preview_job(
 def start_preview(
     mode: str,
     credentials: dict[str, Any],
-    articles: list[str] | None = None,
+    articles: list[XmlRequest] | None = None,
     fresh_catalog: bool = False,
 ) -> dict[str, str]:
     job_id = secrets.token_hex(12)
@@ -1460,8 +1642,11 @@ def render_page() -> str:
         <label>Додати артикул у чергу вручну
           <input id="manualArticle" autocomplete="off" placeholder="Наприклад: X33">
         </label>
+        <label>Бренд (необов'язково)
+          <input id="manualBrand" autocomplete="off" placeholder="Наприклад: BRUDER">
+        </label>
         <button id="manualAddButton" class="secondary" type="button">Перевірити і додати</button>
-        <div id="manualAddHint" class="muted">Перевіряє, чи є фото в локальному XML, і додає артикул у чергу змін.</div>
+        <div id="manualAddHint" class="muted">Порожній бренд не фільтрує: буде використано перший варіант артикула з XML.</div>
       </div>
       <div class="toolbar">
         <label style="display:flex;align-items:center;gap:8px;font-weight:700;">
@@ -1475,7 +1660,7 @@ def render_page() -> str:
         <div class="muted">Останнє оновлення: <strong id="catalogUpdatedAt">-</strong></div>
         <div class="muted">Локальний файл: <span id="catalogLocalPath">-</span></div>
       </div>
-      <div class="muted">В Excel читається перший стовпець першого аркуша: артикул для відображення на сайті.</div>
+      <div class="muted">Excel за замовчуванням читає лише артикул з першого стовпця. Для вибору бренду назвіть другий стовпець «Бренд» або «Brand»: порожній бренд не обробляється як brand=&quot;&quot;, а бере перший варіант артикула з XML. Для заповненого бренду спочатку шукається точний збіг, потім збіг без урахування регістру; якщо варіанту немає, буде показано доступні бренди.</div>
     </section>
     <div class="grid">
       <div class="metric"><span>Змінені артикули</span><strong id="dirtyCount">0</strong></div>
@@ -1533,6 +1718,7 @@ def render_page() -> str:
     const shopPassword = document.getElementById('shopPassword');
     const credentialNotice = document.getElementById('credentialNotice');
     const manualArticle = document.getElementById('manualArticle');
+    const manualBrand = document.getElementById('manualBrand');
     const manualAddButton = document.getElementById('manualAddButton');
     const manualAddHint = document.getElementById('manualAddHint');
     const excelFile = document.getElementById('excelFile');
@@ -1666,18 +1852,19 @@ def render_page() -> str:
         return;
       }}
       let markup = '<table><thead><tr>' +
-        '<th>Артикул</th><th>Статус</th><th>Фото</th><th>Оновлено</th><th>Повідомлення</th><th>Дія</th>' +
+        '<th>Артикул</th><th>Бренд</th><th>Статус</th><th>Фото</th><th>Оновлено</th><th>Повідомлення</th><th>Дія</th>' +
         '</tr></thead><tbody>';
       for (const row of rows) {{
         const status = escapeHtml(row.status || '');
         const article = escapeHtml(row.article || '');
+        const brand = escapeHtml(row.brand || '');
         const updatedAt = escapeHtml(row.updated_at || row.first_seen_at || '');
         let actions = '<span class="muted">-</span>';
         if (mode === 'queue') {{
-          actions = '<button class="small article-sync" type="button" data-article="' + article + '">Оновити</button>' +
-            '<button class="small secondary article-skip" type="button" data-article="' + article + '">Пропустити</button>';
+          actions = '<button class="small article-sync" type="button" data-article="' + article + '" data-brand="' + brand + '">Оновити</button>' +
+            '<button class="small secondary article-skip" type="button" data-article="' + article + '" data-brand="' + brand + '">Пропустити</button>';
         }} else if (mode === 'history') {{
-          actions = '<button class="small secondary history-archive" type="button" data-article="' + article + '" data-updated="' + updatedAt + '">Архівувати</button>';
+          actions = '<button class="small secondary history-archive" type="button" data-article="' + article + '" data-brand="' + brand + '" data-updated="' + updatedAt + '">Архівувати</button>';
         }} else if (mode === 'archive') {{
           actions = '<span class="muted">В архіві</span>';
         }}
@@ -1685,6 +1872,7 @@ def render_page() -> str:
           '<td><strong>' + article + '</strong>' +
           (row.remote_article ? '<div class="muted">H: ' + escapeHtml(row.remote_article) + '</div>' : '') +
           '</td>' +
+          '<td>' + (brand || '<span class="muted">-</span>') + '</td>' +
           '<td class="status-' + status + '">' + status + '</td>' +
           '<td>' + escapeHtml(row.image_count ?? '') + '</td>' +
           '<td>' + updatedAt + '</td>' +
@@ -1701,6 +1889,7 @@ def render_page() -> str:
           try {{
             const data = credentialFormData();
             const article = button.getAttribute('data-article') || '';
+            data.append('brand', button.getAttribute('data-brand') || '');
             const result = await api('/api/sync/article/' + encodeURIComponent(article), {{
               method: 'POST',
               body: data
@@ -1715,8 +1904,11 @@ def render_page() -> str:
         button.addEventListener('click', async () => {{
           try {{
             const article = button.getAttribute('data-article') || '';
+            const data = new FormData();
+            data.append('brand', button.getAttribute('data-brand') || '');
             await api('/api/dirty/' + encodeURIComponent(article) + '/skip', {{
-              method: 'POST'
+              method: 'POST',
+              body: data
             }});
             await refreshState();
           }} catch (error) {{
@@ -1729,6 +1921,7 @@ def render_page() -> str:
           try {{
             const data = new FormData();
             data.append('article', button.getAttribute('data-article') || '');
+            data.append('brand', button.getAttribute('data-brand') || '');
             data.append('updated_at', button.getAttribute('data-updated') || '');
             await api('/api/history/archive-item', {{
               method: 'POST',
@@ -2007,7 +2200,8 @@ def render_page() -> str:
     shopPassword.addEventListener('input', clearCredentialNotice);
 
     async function addManualArticle() {{
-      const article = manualArticle.value.trim();
+        const article = manualArticle.value.trim();
+      const brand = manualBrand.value.trim();
       if (!article) {{
         manualArticle.classList.add('input-error');
         manualArticle.focus();
@@ -2021,13 +2215,15 @@ def render_page() -> str:
       try {{
         const data = new FormData();
         data.append('article', article);
+        data.append('brand', brand);
         const result = await api('/api/dirty/manual', {{
           method: 'POST',
           body: data
         }});
         manualArticle.value = '';
+        manualBrand.value = '';
         manualAddHint.className = 'notice notice-success';
-        manualAddHint.textContent = 'Артикул ' + result.article + ' додано в чергу. Фото: ' + result.image_count + '.';
+        manualAddHint.textContent = 'Артикул ' + result.article + (result.brand ? ' (' + result.brand + ')' : '') + ' додано в чергу. Фото: ' + result.image_count + '.';
         statusBox.textContent = manualAddHint.textContent;
         await refreshState();
       }} catch (error) {{
@@ -2145,7 +2341,7 @@ async def api_sync_article(article: str, request: Request) -> dict[str, str]:
     return start_sync(
         "article",
         credentials_from_form(form),
-        [article],
+        [XmlRequest(article, str(form.get("brand", "")))],
         fresh_catalog=fresh_catalog_from_form(form),
     )
 
@@ -2237,7 +2433,10 @@ async def api_mark_dirty_manual(request: Request) -> dict[str, Any]:
     protected_json(request)
     form = await request.form()
     try:
-        return add_manual_dirty_article(str(form.get("article", "")))
+        return add_manual_dirty_article(
+            str(form.get("article", "")),
+            str(form.get("brand", "")),
+        )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
@@ -2253,20 +2452,22 @@ def api_skip_all_dirty(request: Request) -> dict[str, Any]:
 
 
 @app.post("/api/dirty/{article}")
-def api_mark_dirty(article: str, request: Request) -> dict[str, Any]:
+async def api_mark_dirty(article: str, request: Request) -> dict[str, Any]:
     protected_json(request)
+    form = await request.form()
     try:
-        return add_manual_dirty_article(article)
+        return add_manual_dirty_article(article, str(form.get("brand", "")))
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 @app.post("/api/dirty/{article}/skip")
-def api_skip_dirty(article: str, request: Request) -> dict[str, Any]:
+async def api_skip_dirty(article: str, request: Request) -> dict[str, Any]:
     protected_json(request)
+    form = await request.form()
     with STATE_LOCK:
         state = get_state()
-        skipped = state.skip_dirty(article)
+        skipped = state.skip_dirty(article, str(form.get("brand", "")))
         state.save()
     if not skipped:
         raise HTTPException(status_code=404, detail="Артикул не знайдено в черзі.")
@@ -2298,10 +2499,11 @@ async def api_archive_history_item(request: Request) -> dict[str, Any]:
     protected_json(request)
     form = await request.form()
     article = str(form.get("article", ""))
+    brand = str(form.get("brand", ""))
     updated_at = str(form.get("updated_at", ""))
     with STATE_LOCK:
         state = get_state()
-        archived = state.archive_history_item(article, updated_at)
+        archived = state.archive_history_item(article, updated_at, brand)
         state.save()
     if not archived:
         raise HTTPException(status_code=404, detail="Подію не знайдено в останніх подіях.")

@@ -86,11 +86,47 @@ class BuildXmlTests(unittest.TestCase):
             product = root_element.find("product")
             self.assertIsNotNone(product)
             self.assertEqual(product.attrib["article"], "X36B")
+            self.assertEqual(product.attrib["brand"], "Каталог")
             urls = [element.text for element in product.findall("image")]
             self.assertTrue(urls[0].endswith("/X36B.jpg"))
             self.assertTrue(urls[1].endswith("/X36B_2.jpg"))
             self.assertTrue(urls[2].endswith("/X36B_10.jpg"))
             self.assertIn("%D0%9A", urls[0])
+
+    def test_groups_same_article_by_brand_and_requires_main_image(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            images = root / "images"
+            output = root / "out" / "products.xml"
+            (images / "BRUDER" / "Nested").mkdir(parents=True)
+            (images / "OTHER").mkdir()
+            (images / "BRUDER" / "01063.jpg").touch()
+            (images / "BRUDER" / "01063_1.jpg").touch()
+            (images / "BRUDER" / "Nested" / "01063.jpg").touch()
+            (images / "OTHER" / "01063_1.jpg").touch()
+            (images / "ROOT.jpg").touch()
+
+            products, image_count = build_xml(
+                {
+                    "images_dir": images,
+                    "output_xml": output,
+                    "base_url": "https://img.example.com/foto",
+                    "allowed_extensions": {".jpg"},
+                }
+            )
+
+            self.assertEqual((products, image_count), (3, 4))
+            root_element = ET.parse(output).getroot()
+            found = {
+                (product.attrib["article"], product.attrib["brand"]): [
+                    image.text for image in product.findall("image")
+                ]
+                for product in root_element.findall("product")
+            }
+            self.assertEqual(len(found[("01063", "BRUDER")]), 2)
+            self.assertEqual(len(found[("01063", "BRUDER/Nested")]), 1)
+            self.assertNotIn(("01063", "OTHER"), found)
+            self.assertIn(("ROOT", ""), found)
 
 
 class LoggingTests(unittest.TestCase):
