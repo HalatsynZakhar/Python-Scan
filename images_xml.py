@@ -84,7 +84,6 @@ class ReliableClock:
 RELIABLE_CLOCK: ReliableClock | None = None
 CLOCK_SOURCE = "system"
 CLOCK_WARNING: str | None = None
-LAST_MISSING_MAIN_GROUPS: frozenset[tuple[str, str]] | None = None
 
 
 def query_ntp_time(server: str, timeout: float = 3.0) -> float:
@@ -371,7 +370,11 @@ def parse_filename(file_path: Path) -> tuple[str, tuple[int, int | str]]:
     return article, (2, suffix.casefold())
 
 
-def build_xml(config: dict[str, Any]) -> tuple[int, int]:
+def build_xml(
+    config: dict[str, Any],
+    *,
+    log_missing_main_groups: bool = False,
+) -> tuple[int, int]:
     images_dir: Path = config["images_dir"]
     output_xml: Path = config["output_xml"]
     images_base_url: str = (
@@ -416,23 +419,15 @@ def build_xml(config: dict[str, Any]) -> tuple[int, int]:
             continue
         valid_products[(article, brand)] = images
 
-    global LAST_MISSING_MAIN_GROUPS
-    current_missing_groups = frozenset(missing_main_groups)
-    if current_missing_groups != LAST_MISSING_MAIN_GROUPS:
-        if current_missing_groups:
-            examples = ", ".join(
-                f"{article} ({brand or '/'})"
-                for article, brand in sorted(current_missing_groups)[:5]
-            )
-            extra = len(current_missing_groups) - 5
-            suffix = f"; ще {extra}" if extra > 0 else ""
-            log(
-                "Пропущено груп без ключового зображення: "
-                f"{len(current_missing_groups)} | приклади: {examples}{suffix}"
-            )
-        elif LAST_MISSING_MAIN_GROUPS:
-            log("Усі групи фото тепер мають ключове зображення.")
-        LAST_MISSING_MAIN_GROUPS = current_missing_groups
+    if missing_main_groups and log_missing_main_groups:
+        examples = ", ".join(
+            f"{article} ({brand or '/'})"
+            for article, brand in sorted(missing_main_groups)
+        )
+        log(
+            "Пропущено груп без ключового зображення: "
+            f"{len(missing_main_groups)} | {examples}"
+        )
 
     product_count = len(valid_products)
     image_count = sum(len(images) for images in valid_products.values())
@@ -545,7 +540,7 @@ class ImagesChangeHandler(FileSystemEventHandler):
             return
 
         try:
-            build_xml(self.config)
+            build_xml(self.config, log_missing_main_groups=True)
         except Exception as error:
             log(f"Помилка оновлення XML: {error}")
         finally:

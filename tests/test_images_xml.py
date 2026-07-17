@@ -128,7 +128,7 @@ class BuildXmlTests(unittest.TestCase):
             self.assertNotIn(("01063", "OTHER"), found)
             self.assertIn(("ROOT", ""), found)
 
-    def test_logs_missing_main_groups_once_as_a_summary(self):
+    def test_logs_full_missing_main_groups_only_for_file_events(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             images = root / "images"
@@ -138,20 +138,15 @@ class BuildXmlTests(unittest.TestCase):
             (images / "A" / "X_1.jpg").touch()
             (images / "B" / "Y_1.jpg").touch()
 
-            original_missing_groups = images_xml.LAST_MISSING_MAIN_GROUPS
-            images_xml.LAST_MISSING_MAIN_GROUPS = None
-            try:
-                with patch("images_xml.log") as mocked_log:
-                    config = {
-                        "images_dir": images,
-                        "output_xml": output,
-                        "base_url": "https://img.example.com/foto",
-                        "allowed_extensions": {".jpg"},
-                    }
-                    build_xml(config)
-                    build_xml(config)
-            finally:
-                images_xml.LAST_MISSING_MAIN_GROUPS = original_missing_groups
+            with patch("images_xml.log") as mocked_log:
+                config = {
+                    "images_dir": images,
+                    "output_xml": output,
+                    "base_url": "https://img.example.com/foto",
+                    "allowed_extensions": {".jpg"},
+                }
+                build_xml(config)
+                build_xml(config, log_missing_main_groups=True)
 
         warnings = [
             str(call.args[0])
@@ -397,7 +392,10 @@ class ChangeHandlerTests(unittest.TestCase):
         with patch("images_xml.build_xml") as mocked_build:
             handler.dispatch(FileCreatedEvent(r"D:\images\X36B.jpg"))
 
-        mocked_build.assert_called_once_with(handler.config)
+        mocked_build.assert_called_once_with(
+            handler.config,
+            log_missing_main_groups=True,
+        )
 
     def test_unrelated_file_event_is_ignored(self):
         handler = self.make_handler()
@@ -413,7 +411,10 @@ class ChangeHandlerTests(unittest.TestCase):
         with patch("images_xml.build_xml") as mocked_build:
             handler.dispatch(DirDeletedEvent(r"D:\images\catalog"))
 
-        mocked_build.assert_called_once_with(handler.config)
+        mocked_build.assert_called_once_with(
+            handler.config,
+            log_missing_main_groups=True,
+        )
 
     def test_opening_image_does_not_rebuild_xml(self):
         handler = self.make_handler()

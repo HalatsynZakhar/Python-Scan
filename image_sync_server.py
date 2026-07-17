@@ -840,7 +840,7 @@ class SyncChangeHandler(FileSystemEventHandler):
 
         try:
             event_type = EVENT_TYPE_LABELS.get(event.event_type, event.event_type)
-            build_xml(self.config)
+            build_xml(self.config, log_missing_main_groups=True)
             xml_products = load_xml_products(self.config["output_xml"])
             counts = image_counts(xml_products)
 
