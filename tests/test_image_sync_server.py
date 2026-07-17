@@ -57,7 +57,7 @@ class ServerSettingsTests(unittest.TestCase):
 
 
 class ExcelArticleTests(unittest.TestCase):
-    def test_reads_article_and_optional_brand(self):
+    def test_reads_first_two_columns_as_article_and_brand(self):
         workbook = Workbook()
         worksheet = workbook.active
         worksheet.append(["Артикул", "Назва"])
@@ -71,10 +71,14 @@ class ExcelArticleTests(unittest.TestCase):
 
         self.assertEqual(
             parse_excel_articles(buffer.getvalue()),
-            [XmlRequest("X33", ""), XmlRequest("X34", "")],
+            [
+                XmlRequest("X33", "Toy"),
+                XmlRequest("X33", "Duplicate"),
+                XmlRequest("X34", "Toy 2"),
+            ],
         )
 
-    def test_reads_brand_only_from_named_brand_column(self):
+    def test_deduplicates_brand_without_regard_to_case(self):
         workbook = Workbook()
         worksheet = workbook.active
         worksheet.append(["Article", "Brand"])

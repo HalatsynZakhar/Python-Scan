@@ -575,7 +575,6 @@ def parse_excel_articles(data: bytes) -> list[XmlRequest]:
     try:
         worksheet = workbook.worksheets[0]
         values: list[XmlRequest] = []
-        brand_column_enabled = False
         for row in worksheet.iter_rows(values_only=True):
             if not row:
                 continue
@@ -591,14 +590,8 @@ def parse_excel_articles(data: bytes) -> list[XmlRequest]:
                 "артикул для відображення",
                 "артикул для отображения",
             }:
-                header_brand = normalize_brand(row[1]) if len(row) > 1 else ""
-                brand_column_enabled = header_brand.casefold() in {"brand", "бренд"}
                 continue
-            brand = (
-                normalize_brand(row[1])
-                if brand_column_enabled and len(row) > 1
-                else ""
-            )
+            brand = normalize_brand(row[1]) if len(row) > 1 else ""
             values.append(XmlRequest(text, brand))
         return unique_xml_requests(values)
     finally:
@@ -1660,7 +1653,7 @@ def render_page() -> str:
         <div class="muted">Останнє оновлення: <strong id="catalogUpdatedAt">-</strong></div>
         <div class="muted">Локальний файл: <span id="catalogLocalPath">-</span></div>
       </div>
-      <div class="muted">Excel за замовчуванням читає лише артикул з першого стовпця. Для вибору бренду назвіть другий стовпець «Бренд» або «Brand»: порожній бренд не обробляється як brand=&quot;&quot;, а бере перший варіант артикула з XML. Для заповненого бренду спочатку шукається точний збіг, потім збіг без урахування регістру; якщо варіанту немає, буде показано доступні бренди.</div>
+      <div class="muted">Excel читає перший стовпець як артикул, другий — як бренд. Порожній бренд не обробляється як brand=&quot;&quot;, а бере перший варіант артикула з XML. Для заповненого бренду спочатку шукається точний збіг, потім збіг без урахування регістру; якщо варіанту немає, буде показано доступні бренди.</div>
     </section>
     <div class="grid">
       <div class="metric"><span>Змінені артикули</span><strong id="dirtyCount">0</strong></div>
