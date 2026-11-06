@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param()
 
 $ErrorActionPreference = "Stop"
@@ -106,6 +106,8 @@ function Stop-ExistingImagesXmlRuntime {
         -LiteralPath (Join-Path $InstallDir "logs\images_xml.pid") `
         -Force `
         -ErrorAction SilentlyContinue
+
+    Start-Sleep -Seconds 3
 }
 
 function Install-WingetPackage {
@@ -588,14 +590,6 @@ function Start-AndVerifyService {
                 $RecentLines |
                     Where-Object { $_ -match "Python-скрипт успішно запущено" }
             )
-            if (
-                $RecentLines |
-                    Where-Object {
-                        $_ -match "Python-скрипт завершився одразу після запуску"
-                    }
-            ) {
-                break
-            }
         }
     }
 
