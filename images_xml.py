@@ -271,7 +271,7 @@ def load_config(config_file: Path = DEFAULT_CONFIG_FILE) -> dict[str, Any]:
             "Створіть його з config.example.json."
         )
 
-    with config_file.open("r", encoding="utf-8") as file:
+    with config_file.open("r", encoding="utf-8-sig") as file:
         raw = json.load(file)
 
     required = ("images_dir",)

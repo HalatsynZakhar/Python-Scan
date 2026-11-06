@@ -190,7 +190,7 @@ class SyncState:
     def load(self) -> None:
         if not self.state_file.exists():
             return
-        with self.state_file.open("r", encoding="utf-8") as file:
+        with self.state_file.open("r", encoding="utf-8-sig") as file:
             data = json.load(file)
         if not isinstance(data, dict):
             return

@@ -65,7 +65,7 @@ class XmlProduct:
 
 
 def read_raw_config(config_file: Path) -> dict[str, Any]:
-    with config_file.open("r", encoding="utf-8") as file:
+    with config_file.open("r", encoding="utf-8-sig") as file:
         data = json.load(file)
     if not isinstance(data, dict):
         raise ValueError("config.json повинен містити JSON-об'єкт.")
