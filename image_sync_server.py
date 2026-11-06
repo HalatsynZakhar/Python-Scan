@@ -158,9 +158,22 @@ def load_server_settings(raw: dict[str, Any], xml_config: dict[str, Any]) -> dic
             "У публічній папці мають бути лише images_export.xml та звичайний журнал."
         )
 
-    admin_user = str(server.get("admin_user") or raw.get("admin_user") or "admin").strip()
+    auth_obj = raw.get("auth") or {}
+    if not isinstance(auth_obj, dict):
+        auth_obj = {}
+
+    admin_user = str(
+        auth_obj.get("username")
+        or auth_obj.get("login")
+        or server.get("admin_user")
+        or raw.get("admin_user")
+        or "admin"
+    ).strip()
     admin_password = str(
-        server.get("admin_password") or raw.get("admin_password") or "Bublik44"
+        auth_obj.get("password")
+        or server.get("admin_password")
+        or raw.get("admin_password")
+        or "Bublik44"
     ).strip()
 
     return {

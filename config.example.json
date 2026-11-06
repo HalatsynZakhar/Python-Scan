@@ -4,20 +4,25 @@
   "xml_filename": "images_export.xml",
   "log_filename": "images_export.log",
   "max_log_lines": 2000,
-  "images_base_url": "image_base_url",
+  "images_base_url": "http://176.104.6.149:8080/foto",
   "task_user": "SYSTEM",
+  "auth": {
+    "username": "admin",
+    "password": "Bublik44"
+  },
+  "admin_user": "admin",
+  "admin_password": "Bublik44",
   "server": {
     "enabled": true,
     "host": "0.0.0.0",
     "port": 8092,
     "admin_user": "admin",
-    "admin_password": "admin_password"
+    "admin_password": "Bublik44"
   },
-  "admin_password": "admin_password",
   "horoshop": {
-    "domain": "horoshop_domain",
-    "login": "horoshop_login",
-    "password": "horoshop_password",
+    "domain": "https://attoys.com.ua",
+    "login": "example@email.com",
+    "password": "change-me",
     "token": "",
     "import_mode": "replace",
     "image_field": "images",
