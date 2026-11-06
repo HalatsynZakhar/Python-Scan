@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import io
 import json
 import os
@@ -16,7 +18,7 @@ from typing import Any
 import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from starlette.datastructures import UploadFile as StarletteUploadFile
@@ -156,11 +158,18 @@ def load_server_settings(raw: dict[str, Any], xml_config: dict[str, Any]) -> dic
             "У публічній папці мають бути лише images_export.xml та звичайний журнал."
         )
 
+    admin_user = str(server.get("admin_user") or raw.get("admin_user") or "admin").strip()
+    admin_password = str(
+        server.get("admin_password") or raw.get("admin_password") or "Bublik44"
+    ).strip()
+
     return {
         "enabled": bool(server.get("enabled", False)),
         "host": str(server.get("host", "0.0.0.0")),
         "port": int(server.get("port", 8092)),
         "state_file": resolved_state_file,
+        "admin_user": admin_user,
+        "admin_password": admin_password,
     }
 
 
@@ -428,8 +437,50 @@ def get_job(job_id: str) -> dict[str, Any]:
     return item
 
 
-def protected_json(_: Request) -> None:
-    return
+SESSION_COOKIE_NAME = "sync_admin_session"
+
+
+def get_admin_session_token(password: str) -> str:
+    return hashlib.sha256(f"{password}:python_scan_horoshop_salt".encode()).hexdigest()
+
+
+def check_authentication(request: Request) -> bool:
+    admin_user = str(SERVER_SETTINGS.get("admin_user", "admin")).strip()
+    admin_password = str(SERVER_SETTINGS.get("admin_password", "Bublik44")).strip()
+
+    if not admin_password:
+        return True
+
+    cookie_token = request.cookies.get(SESSION_COOKIE_NAME)
+    if cookie_token and secrets.compare_digest(
+        cookie_token, get_admin_session_token(admin_password)
+    ):
+        return True
+
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Basic "):
+        try:
+            encoded = auth_header.split(" ", 1)[1].strip()
+            decoded = base64.b64decode(encoded).decode("utf-8")
+            if ":" in decoded:
+                user, pwd = decoded.split(":", 1)
+                if secrets.compare_digest(
+                    user.strip(), admin_user
+                ) and secrets.compare_digest(pwd, admin_password):
+                    return True
+        except Exception:
+            pass
+
+    return False
+
+
+def protected_json(request: Request) -> None:
+    if not check_authentication(request):
+        raise HTTPException(
+            status_code=401,
+            detail="Потрібна авторизація (Логін: admin).",
+            headers={"WWW-Authenticate": 'Basic realm="Horoshop Sync"'},
+        )
 
 
 def image_articles_from_event(
@@ -1396,6 +1447,14 @@ def state_snapshot() -> dict[str, Any]:
     catalog_meta["age_seconds"] = catalog_age_seconds(
         str(catalog_meta.get("updated_at", ""))
     )
+    has_saved_horoshop = bool(
+        HOROSHOP_SETTINGS
+        and (
+            HOROSHOP_SETTINGS.token
+            or (HOROSHOP_SETTINGS.login and HOROSHOP_SETTINGS.password)
+        )
+    )
+    saved_horoshop_login = HOROSHOP_SETTINGS.login if HOROSHOP_SETTINGS else ""
     return {
         "busy": SYNC_LOCK.locked(),
         "dirty_count": len(dirty),
@@ -1404,6 +1463,8 @@ def state_snapshot() -> dict[str, Any]:
         "archive": archive,
         "catalog": catalog_meta,
         "xml": xml_meta,
+        "has_saved_horoshop": has_saved_horoshop,
+        "saved_horoshop_login": saved_horoshop_login,
         "image_field": HOROSHOP_SETTINGS.image_field if HOROSHOP_SETTINGS else "",
         "import_mode": "replace" if HOROSHOP_SETTINGS and HOROSHOP_SETTINGS.override else "append",
         "remove_all_when_no_local_images": (
@@ -1414,7 +1475,149 @@ def state_snapshot() -> dict[str, Any]:
     }
 
 
+def render_login_page(error: str = "") -> str:
+    escaped_error = (
+        f'<div class="notice notice-warning" style="margin-bottom: 20px;">{error}</div>'
+        if error
+        else ""
+    )
+    return f"""<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Horoshop Sync - Вхід</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --ink: #17202a;
+      --muted: #637083;
+      --line: #cbd3df;
+      --card: #ffffff;
+      --accent: #166534;
+      --accent-strong: #14532d;
+      --warning-bg: #fffbeb;
+      --warning-ink: #92400e;
+      --warning-line: #fde68a;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 16px;
+    }}
+    .login-card {{
+      width: 100%;
+      max-width: 400px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 32px;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.05);
+    }}
+    h1 {{
+      margin: 0 0 8px;
+      font-size: 24px;
+      font-weight: 700;
+    }}
+    .subtitle {{
+      margin: 0 0 24px;
+      color: var(--muted);
+      font-size: 14px;
+    }}
+    label {{
+      display: block;
+      margin-bottom: 16px;
+      font-size: 14px;
+      font-weight: 600;
+    }}
+    input {{
+      width: 100%;
+      margin-top: 6px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font-size: 15px;
+      background: #fff;
+      box-sizing: border-box;
+    }}
+    input:focus {{
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(22, 101, 52, 0.15);
+    }}
+    button {{
+      width: 100%;
+      padding: 12px;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 8px;
+    }}
+    button:hover {{
+      background: var(--accent-strong);
+    }}
+    .notice {{
+      padding: 12px 14px;
+      border-radius: 6px;
+      font-size: 13px;
+      line-height: 1.4;
+    }}
+    .notice-warning {{
+      background: var(--warning-bg);
+      color: var(--warning-ink);
+      border: 1px solid var(--warning-line);
+    }}
+    .hint {{
+      margin-top: 20px;
+      text-align: center;
+      font-size: 12px;
+      color: var(--muted);
+    }}
+  </style>
+</head>
+<body>
+  <div class="login-card">
+    <h1>Horoshop Sync</h1>
+    <div class="subtitle">Вхід у панель синхронізації</div>
+    {escaped_error}
+    <form method="post" action="/login">
+      <label>
+        Логін
+        <input type="text" name="username" value="admin" required autocomplete="username" autofocus>
+      </label>
+      <label>
+        Пароль
+        <input type="password" name="password" required autocomplete="current-password">
+      </label>
+      <button type="submit">Увійти</button>
+    </form>
+    <div class="hint">Логін: admin &bull; Пароль вказано в налаштуваннях</div>
+  </div>
+</body>
+</html>"""
+
+
 def render_page() -> str:
+    has_saved_horoshop = bool(
+        HOROSHOP_SETTINGS
+        and (
+            HOROSHOP_SETTINGS.token
+            or (HOROSHOP_SETTINGS.login and HOROSHOP_SETTINGS.password)
+        )
+    )
+    saved_horoshop_login = HOROSHOP_SETTINGS.login if HOROSHOP_SETTINGS else ""
     return f"""<!doctype html>
 <html lang="uk">
 <head>
@@ -1631,6 +1834,24 @@ def render_page() -> str:
     .is-hidden {{ display: none; }}
     .section-heading {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }}
     .empty {{ padding: 18px; color: var(--muted); }}
+    .logout-btn {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 9px 14px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: #b91c1c;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+    }}
+    .logout-btn:hover {{
+      background: #fef2f2;
+      border-color: #fca5a5;
+    }}
     @media (max-width: 760px) {{
       header {{ align-items: flex-start; flex-direction: column; }}
       main {{ padding: 16px; }}
@@ -1646,27 +1867,31 @@ def render_page() -> str:
   <header>
     <div>
       <h1>Horoshop Sync</h1>
-      <div class="muted">Локальна панель без окремого пароля</div>
+      <div class="muted">Локальна панель керування</div>
     </div>
     <div class="toolbar">
       <button id="refreshButton" class="secondary" type="button">Оновити статус</button>
       <button id="rebuildButton" class="secondary" type="button">Перебудувати XML</button>
       <button id="previewDirtyButton" class="secondary" type="button">Перевірити змінені</button>
       <button id="syncDirtyButton" type="button">Оновити змінені артикули</button>
+      <a href="/logout" class="logout-btn" title="Вийти з панелі">Вийти</a>
     </div>
   </header>
   <main>
     <section class="panel">
       <div>
         <h2 class="panel-title">Доступ до Хорошоп</h2>
-        <p class="panel-description">Дані потрібні лише під час перевірки або оновлення.</p>
+        <p class="panel-description">Параметри доступу для оновлення товарів та завантаження каталогу.</p>
+      </div>
+      <div id="savedCredsBanner" class="notice notice-success{' is-hidden' if not has_saved_horoshop else ''}" style="margin-bottom:12px;">
+        У config.json збережено доступ до Хорошоп{f' ({saved_horoshop_login})' if saved_horoshop_login else ''}. Поля нижче заповнювати не обов’язково.
       </div>
       <div class="fields">
         <label>Логін Хорошоп
-          <input id="shopLogin" autocomplete="username" placeholder="api@example.com">
+          <input id="shopLogin" autocomplete="username" placeholder="{saved_horoshop_login + ' (збережено в config)' if saved_horoshop_login else 'api@example.com'}">
         </label>
         <label>Пароль Хорошоп
-          <input id="shopPassword" type="password" autocomplete="current-password">
+          <input id="shopPassword" type="password" autocomplete="current-password" placeholder="{'•••••••••••• (збережено в config)' if has_saved_horoshop else ''}">
         </label>
       </div>
       <div id="credentialNotice" class="notice notice-warning is-hidden">
@@ -1785,6 +2010,9 @@ def render_page() -> str:
     const shopLogin = document.getElementById('shopLogin');
     const shopPassword = document.getElementById('shopPassword');
     const credentialNotice = document.getElementById('credentialNotice');
+    const savedCredsBanner = document.getElementById('savedCredsBanner');
+    let hasSavedHoroshop = {str(has_saved_horoshop).lower()};
+    let savedHoroshopLogin = "{saved_horoshop_login}";
     const manualArticle = document.getElementById('manualArticle');
     const manualBrand = document.getElementById('manualBrand');
     const manualAddButton = document.getElementById('manualAddButton');
@@ -1849,6 +2077,10 @@ def render_page() -> str:
         headers: {{ 'Accept': 'application/json' }},
         ...options
       }});
+      if (response.status === 401) {{
+        window.location.href = '/login';
+        throw new Error('Сесія завершилась. Будь ласка, авторизуйтесь знову.');
+      }}
       if (!response.ok) {{
         let message = response.statusText;
         try {{
@@ -1863,14 +2095,14 @@ def render_page() -> str:
     function credentialFormData() {{
       const login = shopLogin.value.trim();
       const password = shopPassword.value;
-      if (!login || !password) {{
+      if (!hasSavedHoroshop && (!login || !password)) {{
         showCredentialNotice('Введіть логін і пароль Хорошопа. Без них сайт не дозволить перевірити каталог або оновити фото.');
         throw new Error('Введіть логін і пароль Хорошопа.');
       }}
       clearCredentialNotice();
       const data = new FormData();
-      data.append('login', login);
-      data.append('password', password);
+      if (login) data.append('login', login);
+      if (password) data.append('password', password);
       data.append('fresh_catalog', freshCatalog.checked ? '1' : '0');
       return data;
     }}
@@ -1899,18 +2131,20 @@ def render_page() -> str:
     function requireFullUpdateCredentials() {{
       const login = shopLogin.value.trim();
       const password = shopPassword.value;
-      if (!login || !password) {{
+      if (!hasSavedHoroshop && (!login || !password)) {{
         showCredentialNotice('Для повного оновлення обов’язково введіть логін і пароль Хорошопа, а потім повторіть їх у підтвердженні.');
         throw new Error('Введіть логін і пароль Хорошопа.');
       }}
       clearCredentialNotice();
-      const repeatedLogin = window.prompt('Повторно введіть логін Хорошопа для повного оновлення:') || '';
-      if (repeatedLogin.trim() !== login) {{
-        throw new Error('Повторний логін не збігається. Повне оновлення скасовано.');
-      }}
-      const repeatedPassword = window.prompt('Повторно введіть пароль Хорошопа для повного оновлення:') || '';
-      if (repeatedPassword !== password) {{
-        throw new Error('Повторний пароль не збігається. Повне оновлення скасовано.');
+      if (login && password) {{
+        const repeatedLogin = window.prompt('Повторно введіть логін Хорошопа для повного оновлення:') || '';
+        if (repeatedLogin.trim() !== login) {{
+          throw new Error('Повторний логін не збігається. Повне оновлення скасовано.');
+        }}
+        const repeatedPassword = window.prompt('Повторно введіть пароль Хорошопа для повного оновлення:') || '';
+        if (repeatedPassword !== password) {{
+          throw new Error('Повторний пароль не збігається. Повне оновлення скасовано.');
+        }}
       }}
     }}
 
@@ -2065,6 +2299,24 @@ def render_page() -> str:
       busyState.textContent = state.busy ? 'Працює' : 'Вільно';
       imageField.textContent = state.image_field || '-';
       importMode.textContent = state.import_mode || '-';
+      if (state.has_saved_horoshop !== undefined) {{
+        hasSavedHoroshop = Boolean(state.has_saved_horoshop);
+      }}
+      if (state.saved_horoshop_login !== undefined) {{
+        savedHoroshopLogin = state.saved_horoshop_login || '';
+      }}
+      if (hasSavedHoroshop) {{
+        savedCredsBanner.textContent = 'У config.json збережено доступ до Хорошоп' + (savedHoroshopLogin ? ' (' + savedHoroshopLogin + ')' : '') + '. Поля нижче заповнювати не обов’язково.';
+        savedCredsBanner.classList.remove('is-hidden');
+        if (!shopLogin.value.trim() && savedHoroshopLogin) {{
+          shopLogin.placeholder = savedHoroshopLogin + ' (збережено в config)';
+        }}
+        if (!shopPassword.value) {{
+          shopPassword.placeholder = '•••••••••••• (збережено в config)';
+        }}
+      }} else {{
+        savedCredsBanner.classList.add('is-hidden');
+      }}
       renderTable(dirtyTable, state.dirty || [], 'queue');
       renderTable(historyTable, state.history || [], 'history');
       renderTable(archiveTable, state.archive || [], 'archive');
@@ -2346,9 +2598,55 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Python Scan Horoshop Sync", lifespan=lifespan)
 
 
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request) -> Response:
+    if check_authentication(request):
+        return RedirectResponse(url="/", status_code=303)
+    return HTMLResponse(render_login_page())
+
+
+@app.post("/login")
+async def login_submit(request: Request) -> Response:
+    form = await request.form()
+    username = str(form.get("username", "")).strip()
+    password = str(form.get("password", ""))
+
+    admin_user = str(SERVER_SETTINGS.get("admin_user", "admin")).strip()
+    admin_password = str(SERVER_SETTINGS.get("admin_password", "Bublik44")).strip()
+
+    if secrets.compare_digest(username, admin_user) and secrets.compare_digest(
+        password, admin_password
+    ):
+        response = RedirectResponse(url="/", status_code=303)
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=get_admin_session_token(admin_password),
+            max_age=30 * 24 * 3600,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+        return response
+
+    return HTMLResponse(
+        render_login_page(error="Невірний логін або пароль. Спробуйте ще раз."),
+        status_code=401,
+    )
+
+
+@app.get("/logout")
+@app.post("/logout")
+def logout() -> Response:
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie(key=SESSION_COOKIE_NAME, path="/")
+    return response
+
+
 @app.get("/", response_class=HTMLResponse)
-def index(request: Request) -> str:
-    return render_page()
+def index(request: Request) -> Response:
+    if not check_authentication(request):
+        return RedirectResponse(url="/login", status_code=303)
+    return HTMLResponse(render_page())
 
 
 @app.get("/status")
@@ -2371,7 +2669,8 @@ def api_state(request: Request) -> dict[str, Any]:
 
 
 @app.get("/api/excel-template")
-def api_excel_template() -> Response:
+def api_excel_template(request: Request) -> Response:
+    protected_json(request)
     return Response(
         content=build_excel_template(),
         media_type=(

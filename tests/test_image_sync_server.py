@@ -7,19 +7,29 @@ from openpyxl import Workbook, load_workbook
 
 from image_sync_server import (
     LOCAL_DATA_DIR,
+    SESSION_COOKIE_NAME,
     SyncState,
     add_manual_dirty_article,
     build_excel_template,
     catalog_age_seconds,
+    check_authentication,
+    get_admin_session_token,
     load_or_refresh_catalog,
     load_server_settings,
     parse_excel_articles,
     prepare_import_plan,
+    protected_json,
     queue_preview_articles,
     validate_image_url,
     XmlRequest,
 )
 from horoshop_sync import CatalogIndex, HoroshopSettings, XmlProduct
+
+
+class MockRequest:
+    def __init__(self, cookies=None, headers=None):
+        self.cookies = cookies or {}
+        self.headers = headers or {}
 
 
 class ServerSettingsTests(unittest.TestCase):
@@ -41,6 +51,24 @@ class ServerSettingsTests(unittest.TestCase):
         self.assertEqual(settings["port"], 8092)
         self.assertEqual(settings["state_file"], LOCAL_DATA_DIR / "horoshop_sync_state.json")
         self.assertNotIn("access_password", settings)
+        self.assertEqual(settings["admin_user"], "admin")
+        self.assertEqual(settings["admin_password"], "Bublik44")
+
+    def test_server_settings_custom_admin_credentials(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            settings = load_server_settings(
+                {
+                    "server": {
+                        "enabled": True,
+                        "admin_user": "custom_admin",
+                        "admin_password": "CustomPassword123",
+                    }
+                },
+                {"output_dir": output_dir},
+            )
+        self.assertEqual(settings["admin_user"], "custom_admin")
+        self.assertEqual(settings["admin_password"], "CustomPassword123")
 
     def test_server_state_file_cannot_be_inside_public_output_dir(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -55,6 +83,44 @@ class ServerSettingsTests(unittest.TestCase):
                     },
                     {"output_dir": output_dir},
                 )
+
+
+class AuthenticationTests(unittest.TestCase):
+    def setUp(self):
+        import image_sync_server
+        self.original_settings = dict(image_sync_server.SERVER_SETTINGS)
+        image_sync_server.SERVER_SETTINGS = {
+            "admin_user": "admin",
+            "admin_password": "Bublik44",
+        }
+
+    def tearDown(self):
+        import image_sync_server
+        image_sync_server.SERVER_SETTINGS = self.original_settings
+
+    def test_check_authentication_success_with_cookie(self):
+        token = get_admin_session_token("Bublik44")
+        req = MockRequest(cookies={SESSION_COOKIE_NAME: token})
+        self.assertTrue(check_authentication(req))
+
+    def test_check_authentication_success_with_basic_auth(self):
+        import base64
+        cred = base64.b64encode(b"admin:Bublik44").decode("ascii")
+        req = MockRequest(headers={"Authorization": f"Basic {cred}"})
+        self.assertTrue(check_authentication(req))
+
+    def test_check_authentication_fails_invalid_password(self):
+        import base64
+        cred = base64.b64encode(b"admin:WrongPass").decode("ascii")
+        req = MockRequest(headers={"Authorization": f"Basic {cred}"})
+        self.assertFalse(check_authentication(req))
+
+    def test_protected_json_raises_401(self):
+        from fastapi import HTTPException
+        req = MockRequest()
+        with self.assertRaises(HTTPException) as cm:
+            protected_json(req)
+        self.assertEqual(cm.exception.status_code, 401)
 
 
 class ExcelArticleTests(unittest.TestCase):
