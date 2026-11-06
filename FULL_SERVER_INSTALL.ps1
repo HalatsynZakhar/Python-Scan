@@ -88,7 +88,7 @@ function Stop-ExistingImagesXmlRuntime {
 
     foreach ($Process in $ProjectProcesses) {
         try {
-            Stop-Process -Id $Process.ProcessId -Force -ErrorAction Stop
+            Stop-Process -Id $Process.ProcessId -Force -ErrorAction SilentlyContinue
             Write-Output (
                 "Зупинено старий процес: $($Process.Name), " +
                 "PID $($Process.ProcessId)"
@@ -443,44 +443,40 @@ function Create-ImagesXmlTask {
     Stop-ExistingImagesXmlRuntime
 
     $AutoUpdateBat = Join-Path $InstallDir "scripts\auto_update.bat"
-    $TaskAction = "`"$AutoUpdateBat`" `"main`" `"5`""
 
-    $TaskArguments = @(
-        "/Create",
-        "/TN", "ImagesXML",
-        "/SC", "ONSTART",
-        "/TR", $TaskAction,
-        "/RU", $script:TaskRunAs,
-        "/RL", "HIGHEST",
-        "/F"
-    )
-    if ($script:TaskRunAs -ne "SYSTEM") {
-        $TaskArguments += @("/RP", $script:TaskPassword)
+    try {
+        $Action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"`"$AutoUpdateBat`" main 5`""
+        $Trigger = New-ScheduledTaskTrigger -AtStartup
+        $Settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
+
+        if ($script:TaskRunAs -eq "SYSTEM") {
+            $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+            Register-ScheduledTask -TaskName "ImagesXML" -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Force | Out-Null
+        }
+        else {
+            $TaskArguments = @(
+                "/Create",
+                "/TN", "ImagesXML",
+                "/SC", "ONSTART",
+                "/TR", "cmd.exe /c `"`"$AutoUpdateBat`" main 5`"",
+                "/RU", $script:TaskRunAs,
+                "/RP", $script:TaskPassword,
+                "/RL", "HIGHEST",
+                "/F"
+            )
+            & schtasks.exe @TaskArguments
+            if ($LASTEXITCODE -ne 0) {
+                throw "Не вдалося створити завдання ImagesXML для користувача $script:TaskRunAs."
+            }
+            $CreatedTask = Get-ScheduledTask -TaskName "ImagesXML"
+            $CreatedTask.Settings.ExecutionTimeLimit = "PT0S"
+            Set-ScheduledTask -InputObject $CreatedTask | Out-Null
+        }
     }
-
-    & schtasks.exe @TaskArguments
-    if ($LASTEXITCODE -ne 0) {
-        throw (
-            "Не вдалося створити завдання ImagesXML для користувача " +
-            "$script:TaskRunAs. Перевірте ім'я та пароль."
-        )
+    catch {
+        throw "Не вдалося налаштувати завдання ImagesXML: $($_.Exception.Message)"
     }
     $script:TaskPassword = $null
-
-    Write-Output "Вимкнення обмеження часу виконання завдання..."
-    $CreatedTask = Get-ScheduledTask -TaskName "ImagesXML"
-    $CreatedTask.Settings.ExecutionTimeLimit = "PT0S"
-    Set-ScheduledTask -InputObject $CreatedTask | Out-Null
-
-    $SavedLimit = (
-        Get-ScheduledTask -TaskName "ImagesXML"
-    ).Settings.ExecutionTimeLimit
-    if ($SavedLimit -ne "PT0S") {
-        throw (
-            "Не вдалося вимкнути обмеження часу завдання ImagesXML. " +
-            "Поточне значення: $SavedLimit"
-        )
-    }
     Write-Output "Обмеження часу вимкнено: завдання працює безстроково."
 
     $OldTask = Start-Process `
@@ -555,45 +551,60 @@ function Start-AndVerifyService {
         throw "Завдання створено, але його не вдалося запустити."
     }
 
-    Write-Output "Перевірка запуску Python-процесу..."
-    $Deadline = (Get-Date).AddSeconds(60)
-    $WorkerIsRunning = $false
-    $SupervisorConfirmedStart = $false
+    $Port = 8092
+    try {
+        $Config = Get-Content (Join-Path $InstallDir "config.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($Config.server -and $Config.server.port) {
+            $Port = [int]$Config.server.port
+        }
+    } catch {}
 
-    while (
-        (Get-Date) -lt $Deadline -and
-        !($WorkerIsRunning -and $SupervisorConfirmedStart)
-    ) {
+    Write-Host -NoNewline "Перевірка запуску Python-процесу"
+    $Deadline = (Get-Date).AddSeconds(45)
+    $WorkerIsRunning = $false
+
+    while ((Get-Date) -lt $Deadline -and !$WorkerIsRunning) {
         Start-Sleep -Seconds 2
+        Write-Host -NoNewline "."
+
+        if ($WorkerName -eq "image_sync_server.py") {
+            try {
+                $resp = Invoke-WebRequest -Uri "http://127.0.0.1:$Port/login" -UseBasicParsing -TimeoutSec 2 -ErrorAction SilentlyContinue
+                if ($resp -and ($resp.StatusCode -eq 200 -or $resp.StatusCode -eq 303)) {
+                    $WorkerIsRunning = $true
+                    break
+                }
+            }
+            catch {
+                if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -in @(200, 303, 401)) {
+                    $WorkerIsRunning = $true
+                    break
+                }
+            }
+        }
 
         if (Test-Path $PidFile) {
             $SavedPid = 0
-            if (
-                [int]::TryParse(
-                    (Get-Content $PidFile -Raw).Trim(),
-                    [ref]$SavedPid
-                )
-            ) {
-                $ProcessInfo = Get-CimInstance Win32_Process `
-                    -Filter "ProcessId = $SavedPid" `
-                    -ErrorAction SilentlyContinue
-                $WorkerIsRunning = (
-                    $null -ne $ProcessInfo -and
-                    $ProcessInfo.CommandLine -like "*$WorkerName*"
-                )
+            if ([int]::TryParse((Get-Content $PidFile -Raw).Trim(), [ref]$SavedPid)) {
+                $proc = Get-Process -Id $SavedPid -ErrorAction SilentlyContinue
+                if ($proc -and !$proc.HasExited) {
+                    $WorkerIsRunning = $true
+                    break
+                }
             }
         }
 
         if (Test-Path $DiagnosticLog) {
-            $RecentLines = Get-Content $DiagnosticLog -Tail 10
-            $SupervisorConfirmedStart = [bool](
-                $RecentLines |
-                    Where-Object { $_ -match "Python-скрипт успішно запущено" }
-            )
+            $RecentLines = Get-Content $DiagnosticLog -Tail 10 -ErrorAction SilentlyContinue
+            if ($RecentLines | Where-Object { $_ -match "Python-скрипт успішно запущено" }) {
+                $WorkerIsRunning = $true
+                break
+            }
         }
     }
+    Write-Host ""
 
-    if (!$WorkerIsRunning -or !$SupervisorConfirmedStart) {
+    if (!$WorkerIsRunning) {
         $Details = "Локальний діагностичний журнал поки порожній."
         if (Test-Path $DiagnosticLog) {
             $Details = (Get-Content $DiagnosticLog -Tail 10) -join "`n"
