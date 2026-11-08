@@ -252,6 +252,14 @@ function Start-Worker {
     Remove-Item -LiteralPath $WorkerOutputLog -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $WorkerErrorLog -Force -ErrorAction SilentlyContinue
 
+    try {
+        $allPids = [System.Collections.Generic.HashSet[int]]::new()
+        Get-Process | ForEach-Object { [void]$allPids.Add($_.Id) }
+        Get-CimInstance Win32_Process -Filter "Name = 'conhost.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { !$allPids.Contains($_.ParentProcessId) } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch {}
+
     $script:Worker = Start-Process `
         -FilePath $PythonExe `
         -ArgumentList "`"$WorkerScript`"" `
@@ -267,7 +275,7 @@ function Start-Worker {
     Start-Sleep -Seconds 5
     $script:Worker.Refresh()
     if ($script:Worker.HasExited) {
-        $ExitCode = $script:Worker.ExitCode
+        $ExitCode = try { $script:Worker.ExitCode } catch { $null }
         Remove-Item -LiteralPath $PidFile -Force -ErrorAction SilentlyContinue
 
         $Details = @()

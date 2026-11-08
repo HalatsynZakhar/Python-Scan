@@ -50,6 +50,16 @@ function Update-CurrentPath {
 }
 
 function Stop-ExistingImagesXmlRuntime {
+    try {
+        $allPids = [System.Collections.Generic.HashSet[int]]::new()
+        Get-Process | ForEach-Object { [void]$allPids.Add($_.Id) }
+        Get-CimInstance Win32_Process -Filter "Name = 'conhost.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { !$allPids.Contains($_.ParentProcessId) } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch {}
+    New-Item -ItemType Directory -Path "C:\Windows\System32\config\systemprofile\Desktop" -Force -ErrorAction SilentlyContinue | Out-Null
+    New-Item -ItemType Directory -Path "C:\Windows\SysWOW64\config\systemprofile\Desktop" -Force -ErrorAction SilentlyContinue | Out-Null
+
     Write-Output "Зупинка попереднього екземпляра ImagesXML..."
 
     Start-Process `
