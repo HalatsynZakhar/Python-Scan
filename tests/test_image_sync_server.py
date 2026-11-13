@@ -435,6 +435,42 @@ class QueuePreviewArticleTests(unittest.TestCase):
 
 
 class PreviewAndValidationTests(unittest.TestCase):
+    def test_rate_limit_error_is_saved_and_shown_in_queue(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_file = Path(temp_dir) / "state.json"
+            state = SyncState(state_file)
+            state.mark_dirty("4039", "manual", 3, brand="BABY TEAM")
+            state.mark_dirty("8582", "manual", 2, brand="BABY TEAM")
+
+            import image_sync_server
+
+            original_state = image_sync_server.STATE
+            image_sync_server.STATE = state
+            try:
+                friendly = image_sync_server.record_sync_failure(
+                    "Перевищено годинний ліміт запитів до Хорошопа (код 429): "
+                    "You hour requests limit has been exceeded. Retry after 600 seconds",
+                    mark_queue=True,
+                    requested=[XmlRequest("4039", "BABY TEAM")],
+                )
+                snapshot_error = image_sync_server.state_snapshot()["last_error"]
+            finally:
+                image_sync_server.STATE = original_state
+
+            self.assertIn("429", friendly)
+            self.assertTrue(snapshot_error["is_429"])
+            self.assertEqual(snapshot_error["retry_seconds"], 600)
+            self.assertTrue(snapshot_error["retry_at"])
+            rows = {item["article"]: item for item in state.dirty.values()}
+            self.assertEqual(rows["4039"]["status"], "error")
+            self.assertIn("429", rows["4039"]["message"])
+            self.assertEqual(rows["8582"]["status"], "dirty")
+            reloaded = SyncState(state_file)
+            self.assertTrue(reloaded.last_error["is_429"])
+
+            state.clear_error()
+            self.assertIsNone(state.last_error)
+
     def test_prepare_import_plan_reports_preview_and_skips(self):
         settings = HoroshopSettings(domain="https://shop.example.com", token="token")
         catalog = CatalogIndex.from_raw(

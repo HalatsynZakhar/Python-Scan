@@ -250,6 +250,20 @@ class HoroshopClient:
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as error:
+            resp = getattr(error, "response", None)
+            if resp is not None and resp.status_code == 429:
+                detail = ""
+                try:
+                    r_json = resp.json()
+                    detail = r_json.get("response", {}).get("message") or str(r_json)
+                except Exception:
+                    detail = resp.text[:200]
+                retry_header = resp.headers.get("Retry-After", "")
+                if retry_header and "Retry after" not in detail:
+                    detail += f" Retry after {retry_header} seconds"
+                raise HoroshopError(
+                    f"Перевищено годинний ліміт запитів до Хорошопа (код 429): {detail or 'Too Many Requests'}"
+                ) from error
             raise HoroshopError(f"HTTP-помилка Хорошоп API: {error}") from error
         except ValueError as error:
             raise HoroshopError("Hорошоп повернув не JSON-відповідь.") from error

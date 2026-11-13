@@ -6,12 +6,13 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -198,6 +199,7 @@ class SyncState:
         self.archive: list[dict[str, Any]] = []
         self.catalog_products: list[dict[str, Any]] = []
         self.catalog_updated_at = ""
+        self.last_error: dict[str, Any] | None = None
         self.load()
 
     def load(self) -> None:
@@ -211,6 +213,11 @@ class SyncState:
         history = data.get("history", [])
         archive = data.get("archive", [])
         catalog = data.get("catalog", {})
+        last_error = data.get("last_error")
+        if isinstance(last_error, dict):
+            self.last_error = last_error
+        else:
+            self.last_error = None
         if isinstance(dirty, dict):
             self.dirty = {}
             for article, item in dirty.items():
@@ -245,6 +252,7 @@ class SyncState:
         payload = {
             "schema_version": STATE_SCHEMA_VERSION,
             "updated_at": timestamp(),
+            "last_error": self.last_error,
             "dirty": self.dirty,
             "history": self.history[-STATE_HISTORY_LIMIT:],
             "archive": self.archive[-STATE_HISTORY_LIMIT:],
@@ -258,6 +266,62 @@ class SyncState:
         with temp_file.open("w", encoding="utf-8") as file:
             json.dump(payload, file, ensure_ascii=False, indent=2)
         os.replace(temp_file, self.state_file)
+
+    def set_error(self, message: str) -> dict[str, Any]:
+        msg_str = str(message or "").strip()
+        is_429 = "429" in msg_str or "requests limit" in msg_str.lower()
+        retry_seconds = 0
+        retry_at = ""
+        if is_429:
+            match = re.search(r"Retry after (\d+) seconds", msg_str, re.IGNORECASE)
+            if match:
+                retry_seconds = int(match.group(1))
+                retry_dt = images_xml.now_kyiv() + timedelta(seconds=retry_seconds)
+                retry_at = retry_dt.strftime("%H:%M:%S")
+
+        self.last_error = {
+            "message": msg_str,
+            "is_429": is_429,
+            "retry_seconds": retry_seconds,
+            "retry_at": retry_at,
+            "updated_at": timestamp(),
+        }
+        return self.last_error
+
+    def clear_error(self) -> None:
+        self.last_error = None
+
+    def mark_queue_error(
+        self,
+        message: str,
+        requested: list[XmlRequest] | None = None,
+    ) -> int:
+        """Show a sync failure (e.g. 429) on queued rows without removing them."""
+        if requested:
+            wanted = {
+                state_item_key(normalize_article(req.article), normalize_brand(req.brand))
+                for req in requested
+            }
+            wanted_articles = {
+                normalize_article(req.article).casefold()
+                for req in requested
+                if not normalize_brand(req.brand)
+            }
+            keys = [
+                key
+                for key, item in self.dirty.items()
+                if key in wanted
+                or str(item.get("article", "")).casefold() in wanted_articles
+            ]
+        else:
+            keys = list(self.dirty)
+        now = timestamp()
+        for key in keys:
+            item = self.dirty[key]
+            item["status"] = "error"
+            item["message"] = message
+            item["updated_at"] = now
+        return len(keys)
 
     def mark_dirty(
         self,
@@ -1294,11 +1358,53 @@ def sync_job(
             f"Синхронізація Хорошоп завершена: mode={mode}, "
             f"updated={imported}, skipped={len(skipped)}, failed={len(failed)}"
         )
+        clear_sync_failure()
     except (HoroshopError, OSError, ValueError) as error:
         log(f"Помилка синхронізації Хорошоп: {error}")
-        set_job(job_id, status="error", percent=100, message=str(error))
+        friendly = record_sync_failure(
+            str(error),
+            mark_queue=mode in {"dirty", "article", "excel"},
+            requested=requested_articles if mode != "dirty" else None,
+        )
+        set_job(job_id, status="error", percent=100, message=friendly)
     finally:
         SYNC_LOCK.release()
+
+
+def record_sync_failure(
+    message: str,
+    *,
+    mark_queue: bool = False,
+    requested: list[XmlRequest] | None = None,
+) -> str:
+    """Persist the last Horoshop error and surface it in the queue table."""
+    try:
+        with STATE_LOCK:
+            state = get_state()
+            info = state.set_error(message)
+            friendly = message
+            if info.get("is_429"):
+                when = f" Спробуйте після {info['retry_at']}." if info.get("retry_at") else ""
+                friendly = f"ПОМИЛКА 429: перевищено годинний ліміт запитів Хорошопа.{when} ({message})"
+                info["friendly"] = friendly
+            if mark_queue:
+                state.mark_queue_error(friendly, requested)
+            state.save()
+        return friendly
+    except Exception as state_error:  # never hide the original error
+        log(f"Не вдалося зберегти помилку синхронізації: {state_error}")
+        return message
+
+
+def clear_sync_failure() -> None:
+    try:
+        with STATE_LOCK:
+            state = get_state()
+            if state.last_error is not None:
+                state.clear_error()
+                state.save()
+    except Exception:
+        pass
 
 
 def start_sync(
@@ -1360,9 +1466,10 @@ def refresh_catalog_job(job_id: str, credentials: dict[str, Any]) -> None:
             catalog_updated_at=meta.get("updated_at"),
         )
         log(f"Кеш каталогу Хорошопа оновлено: товарів {len(catalog.products)}")
+        clear_sync_failure()
     except (HoroshopError, OSError, ValueError) as error:
         log(f"Помилка оновлення кешу каталогу Хорошопа: {error}")
-        set_job(job_id, status="error", percent=100, message=str(error))
+        set_job(job_id, status="error", percent=100, message=record_sync_failure(str(error)))
     finally:
         SYNC_LOCK.release()
 
@@ -1468,7 +1575,8 @@ def preview_job(
             report=report,
         )
     except (HoroshopError, OSError, ValueError) as error:
-        set_job(job_id, status="error", percent=100, message=str(error))
+        log(f"Помилка попереднього перегляду Хорошоп: {error}")
+        set_job(job_id, status="error", percent=100, message=record_sync_failure(str(error)))
     finally:
         SYNC_LOCK.release()
 
@@ -1508,6 +1616,7 @@ def state_snapshot() -> dict[str, Any]:
         history = list(reversed(state.history[-50:]))
         archive = list(reversed(state.archive[-100:]))
         catalog_meta = state.catalog_meta()
+        last_error = dict(state.last_error) if state.last_error else None
     catalog_meta["age_seconds"] = catalog_age_seconds(
         str(catalog_meta.get("updated_at", ""))
     )
@@ -1527,6 +1636,7 @@ def state_snapshot() -> dict[str, Any]:
         "archive": archive,
         "catalog": catalog_meta,
         "xml": xml_meta,
+        "last_error": last_error,
         "has_saved_horoshop": has_saved_horoshop,
         "saved_horoshop_login": saved_horoshop_login,
         "image_field": HOROSHOP_SETTINGS.image_field if HOROSHOP_SETTINGS else "",
@@ -1894,6 +2004,8 @@ def render_page() -> str:
     .inline-meta {{ display: grid; gap: 4px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }}
     .notice {{ padding: 11px 12px; border-radius: 8px; border: 1px solid var(--line); background: #fff; font-weight: 700; }}
     .notice-warning {{ border-color: #fbbf24; background: #fffbeb; color: #78350f; }}
+    .notice-error {{ border-color: #f87171; background: #fef2f2; color: #991b1b; white-space: pre-wrap; }}
+    .status-box-error {{ border-color: #f87171; background: #fef2f2; color: #991b1b; font-weight: 700; }}
     .notice-success {{ border-color: #86efac; background: var(--accent-soft); color: var(--accent-strong); }}
     .is-hidden {{ display: none; }}
     .section-heading {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }}
@@ -2029,6 +2141,7 @@ def render_page() -> str:
       <div class="metric"><span>Галерея</span><strong id="imageField">-</strong></div>
       <div class="metric"><span>Режим</span><strong id="importMode">-</strong></div>
     </div>
+    <div id="lastErrorBanner" class="notice notice-error is-hidden"></div>
     <div id="status" class="status">Завантаження...</div>
     <section id="reportPanel" class="panel report-panel">
       <h2>Результат останньої операції</h2>
@@ -2451,6 +2564,20 @@ def render_page() -> str:
         'XML: ' + (xml.path || '-') + '\\n' +
         'Оновлено: ' + (xml.updated_at || '-') + '\\n' +
         'Розмір: ' + (xml.bytes || 0) + ' байт';
+      statusBox.classList.remove('status-box-error');
+      const lastErrorBanner = document.getElementById('lastErrorBanner');
+      const lastError = state.last_error;
+      if (lastError && lastError.message) {{
+        let text = '❌ Остання помилка Хорошопа (' + (lastError.updated_at || '-') + '):\\n' +
+          formatFriendlyMessage(lastError.message);
+        if (lastError.is_429 && lastError.retry_at) {{
+          text += '\\nЛіміт знову буде доступний приблизно о ' + lastError.retry_at + '. Після цього натисніть «Оновити» ще раз.';
+        }}
+        lastErrorBanner.textContent = text;
+        lastErrorBanner.classList.remove('is-hidden');
+      }} else {{
+        lastErrorBanner.classList.add('is-hidden');
+      }}
       setBusy(Boolean(state.busy || activeJob));
     }}
 
@@ -2464,6 +2591,9 @@ def render_page() -> str:
           activeJob = '';
           renderOperationReport(job.report);
           await refreshState();
+          const finalText = formatFriendlyMessage(job.message || '');
+          statusBox.textContent = (job.status === 'error' ? '❌ ' : '') + finalText;
+          statusBox.classList.toggle('status-box-error', job.status === 'error');
           return;
         }}
         await new Promise((resolve) => setTimeout(resolve, 1500));

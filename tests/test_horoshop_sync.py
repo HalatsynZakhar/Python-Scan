@@ -202,6 +202,25 @@ class ImportPayloadTests(unittest.TestCase):
 
 
 class ImportResponseTests(unittest.TestCase):
+    def test_real_http_429_status_is_reported_explicitly(self):
+        import requests
+        from horoshop_sync import HoroshopClient, HoroshopError
+        from unittest.mock import MagicMock
+        settings = HoroshopSettings(domain="https://shop.example.com", token="tok")
+        client = HoroshopClient(settings)
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_response.headers = {"Retry-After": "120"}
+        mock_response.json.return_value = {"response": {"message": "Too many"}}
+        mock_response.raise_for_status.side_effect = requests.HTTPError(
+            "429 Client Error", response=mock_response
+        )
+        client.session.post = MagicMock(return_value=mock_response)
+        with self.assertRaises(HoroshopError) as ctx:
+            client.export_products()
+        self.assertIn("429", str(ctx.exception))
+        self.assertIn("Retry after 120 seconds", str(ctx.exception))
+
     def test_http_error_rate_limit_handled(self):
         from horoshop_sync import HoroshopClient, HoroshopError
         from unittest.mock import MagicMock
