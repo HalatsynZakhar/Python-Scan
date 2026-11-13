@@ -225,8 +225,11 @@ class CatalogCacheTests(unittest.TestCase):
             state.skip_dirty("X34")
 
             moved = state.archive_history_item("X33", state.history[0]["updated_at"])
+            # Second call should be idempotent (return True if already archived)
+            moved_again = state.archive_history_item("X33", state.archive[-1]["updated_at"])
 
         self.assertTrue(moved)
+        self.assertTrue(moved_again)
         self.assertEqual([item["article"] for item in state.history], ["X34"])
         self.assertEqual(state.archive[-1]["article"], "X33")
 

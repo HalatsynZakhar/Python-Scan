@@ -411,6 +411,12 @@ class SyncState:
             self.archive.append(archived)
             self.archive = self.archive[-STATE_HISTORY_LIMIT:]
             return True
+        # If it was already archived, treat as success (idempotent)
+        for item in self.archive:
+            if normalize_article(item.get("article")) == article and normalize_brand(item.get("brand")) == brand:
+                item_updated_at = str(item.get("updated_at") or item.get("first_seen_at") or "")
+                if not updated_at or item_updated_at == updated_at:
+                    return True
         return False
 
 
@@ -1945,14 +1951,18 @@ def render_page() -> str:
         У config.json збережено доступ до Хорошоп{f' ({saved_horoshop_login})' if saved_horoshop_login else ''}. Поля нижче заповнювати не обов’язково.
       </div>
       <div class="fields">
-        <label>Логін Хорошоп
+        <label>Логін API Хорошопа (не плутати з адмін-панеллю!)
           <input id="shopLogin" autocomplete="username" placeholder="{saved_horoshop_login + ' (збережено в config)' if saved_horoshop_login else 'api@example.com'}">
         </label>
-        <label>Пароль Хорошоп
+        <label>Пароль API Хорошопа
           <input id="shopPassword" type="password" autocomplete="current-password" placeholder="{'•••••••••••• (збережено в config)' if has_saved_horoshop else ''}">
         </label>
       </div>
-      <div id="credentialNotice" class="notice notice-warning is-hidden">
+      <div style="margin-top:8px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <button id="clearShopCredsButton" class="small secondary" type="button">🧹 Очистити поля (використовувати config.json)</button>
+        <span class="muted" style="font-size:12px;">Поля потрібні лише якщо ви хочете замінити збережений логін. Якщо очистити — діятиме config.json.</span>
+      </div>
+      <div id="credentialNotice" class="notice notice-warning is-hidden" style="margin-top:8px;">
         Введіть логін і пароль Хорошопа перед перевіркою, експортом або оновленням.
       </div>
     </section>
@@ -2150,9 +2160,35 @@ def render_page() -> str:
       return response.json();
     }}
 
+    function formatFriendlyMessage(message) {{
+      if (!message) return '';
+      if (message.includes('429') || message.includes('limit has been exceeded')) {{
+        const match = message.match(/Retry after (\\d+) seconds/i);
+        const seconds = match ? parseInt(match[1], 10) : 0;
+        const minutes = Math.ceil(seconds / 60);
+        return '⚠️ Перевищено годинний ліміт запитів до API Хорошопа (код 429). Ліміт автоматично оновиться через ' + (minutes > 0 ? minutes + ' хв.' : 'кілька хвилин') + ' (на початку наступної години).';
+      }}
+      if (message.includes('User with such username/password not found')) {{
+        return '⚠️ Помилка авторизації в Хорошоп API: користувача не знайдено. Якщо ви ввели пароль від цієї адмінки — натисніть "Очистити поля", щоб використати збережений у конфігу акаунт HoroshopSync.';
+      }}
+      return message;
+    }}
+
     function credentialFormData() {{
       const login = shopLogin.value.trim();
       const password = shopPassword.value;
+      if (login.toLowerCase() === 'admin') {{
+        showCredentialNotice('⚠️ "admin" — це логін цієї веб-панелі, а не API Хорошопа! Очистіть поля логіна і пароля, щоб використати config.json.');
+        throw new Error('Помилка: "admin" — це логін веб-панелі, а не API Хорошопа. Очистіть поля.');
+      }}
+      if (login && !password) {{
+        showCredentialNotice('Ви ввели логін Хорошопа, але не ввели пароль. Заповніть обидва поля або очистіть обидва, щоб діяв config.json.');
+        throw new Error('Введіть пароль Хорошопа або очистіть логін.');
+      }}
+      if (!login && password) {{
+        showCredentialNotice('Ви ввели пароль Хорошопа, але не ввели логін. Заповніть обидва поля або очистіть обидва, щоб діяв config.json.');
+        throw new Error('Введіть логін Хорошопа або очистіть пароль.');
+      }}
       if (!hasSavedHoroshop && (!login || !password)) {{
         showCredentialNotice('Введіть логін і пароль Хорошопа. Без них сайт не дозволить перевірити каталог або оновити фото.');
         throw new Error('Введіть логін і пароль Хорошопа.');
@@ -2179,7 +2215,7 @@ def render_page() -> str:
     }}
 
     function clearCredentialNotice() {{
-      if (shopLogin.value.trim() && shopPassword.value) {{
+      if ((shopLogin.value.trim() && shopPassword.value) || (!shopLogin.value.trim() && !shopPassword.value)) {{
         credentialNotice.classList.add('is-hidden');
         shopLogin.classList.remove('input-error');
         shopPassword.classList.remove('input-error');
@@ -2189,6 +2225,10 @@ def render_page() -> str:
     function requireFullUpdateCredentials() {{
       const login = shopLogin.value.trim();
       const password = shopPassword.value;
+      if (login.toLowerCase() === 'admin') {{
+        showCredentialNotice('⚠️ "admin" — це логін цієї веб-панелі, а не API Хорошопа! Очистіть поля логіна і пароля.');
+        throw new Error('Помилка: "admin" — це логін веб-панелі, а не API Хорошопа.');
+      }}
       if (!hasSavedHoroshop && (!login || !password)) {{
         showCredentialNotice('Для повного оновлення обов’язково введіть логін і пароль Хорошопа, а потім повторіть їх у підтвердженні.');
         throw new Error('Введіть логін і пароль Хорошопа.');
@@ -2246,17 +2286,24 @@ def render_page() -> str:
       target.innerHTML = markup;
       target.querySelectorAll('.article-sync').forEach((button) => {{
         button.addEventListener('click', async () => {{
+          const originalText = button.textContent;
           try {{
             const data = credentialFormData();
             const article = button.getAttribute('data-article') || '';
             data.append('brand', button.getAttribute('data-brand') || '');
+            button.disabled = true;
+            button.textContent = '⏳ Оновлення...';
+            statusBox.textContent = 'Запуск оновлення для артикула ' + article + '...';
             const result = await api('/api/sync/article/' + encodeURIComponent(article), {{
               method: 'POST',
               body: data
             }});
-            pollJob(result.job_id);
+            await pollJob(result.job_id);
           }} catch (error) {{
-            statusBox.textContent = error.message;
+            statusBox.textContent = formatFriendlyMessage(error.message);
+          }} finally {{
+            button.disabled = false;
+            button.textContent = originalText;
           }}
         }});
       }});
@@ -2272,13 +2319,16 @@ def render_page() -> str:
             }});
             await refreshState();
           }} catch (error) {{
-            statusBox.textContent = error.message;
+            statusBox.textContent = formatFriendlyMessage(error.message);
           }}
         }});
       }});
       target.querySelectorAll('.history-archive').forEach((button) => {{
         button.addEventListener('click', async () => {{
+          const originalText = button.textContent;
           try {{
+            button.disabled = true;
+            button.textContent = 'Архівується...';
             const data = new FormData();
             data.append('article', button.getAttribute('data-article') || '');
             data.append('brand', button.getAttribute('data-brand') || '');
@@ -2289,7 +2339,9 @@ def render_page() -> str:
             }});
             await refreshState();
           }} catch (error) {{
-            statusBox.textContent = error.message;
+            statusBox.textContent = formatFriendlyMessage(error.message);
+            button.disabled = false;
+            button.textContent = originalText;
           }}
         }});
       }});
@@ -2407,7 +2459,7 @@ def render_page() -> str:
       setBusy(true);
       while (activeJob === jobId) {{
         const job = await api('/api/progress/' + encodeURIComponent(jobId));
-        statusBox.textContent = Math.round(job.percent || 0) + '% - ' + (job.message || '');
+        statusBox.textContent = Math.round(job.percent || 0) + '% - ' + formatFriendlyMessage(job.message || '');
         if (job.status === 'done' || job.status === 'warning' || job.status === 'error') {{
           activeJob = '';
           renderOperationReport(job.report);
@@ -2574,7 +2626,21 @@ def render_page() -> str:
     }}
     document.getElementById('archiveHistoryButton').addEventListener('click', archiveHistory);
     document.getElementById('archiveHistoryInlineButton').addEventListener('click', archiveHistory);
-    shopLogin.addEventListener('input', clearCredentialNotice);
+    const clearCredsBtn = document.getElementById('clearShopCredsButton');
+    if (clearCredsBtn) {{
+      clearCredsBtn.addEventListener('click', () => {{
+        shopLogin.value = '';
+        shopPassword.value = '';
+        clearCredentialNotice();
+        statusBox.textContent = 'Поля логіна і пароля очищено. Сервер використовуватиме збережені облікові дані з config.json.';
+      }});
+    }}
+    shopLogin.addEventListener('input', () => {{
+      clearCredentialNotice();
+      if (shopLogin.value.trim().toLowerCase() === 'admin') {{
+        showCredentialNotice('⚠️ "admin" — це логін цієї веб-панелі, а не API Хорошопа. Очистіть поле, щоб використати config.json.');
+      }}
+    }});
     shopPassword.addEventListener('input', clearCredentialNotice);
 
     async function addManualArticle() {{
