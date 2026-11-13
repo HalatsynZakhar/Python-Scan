@@ -689,6 +689,30 @@ def build_excel_template() -> bytes:
     return output.getvalue()
 
 
+def try_load_cards_export(output_dir: Path | None) -> tuple[list[dict[str, Any]], str] | None:
+    if not output_dir:
+        return None
+    cards_file = output_dir / "products_cards_export.json"
+    if not cards_file.exists():
+        return None
+    try:
+        mtime = cards_file.stat().st_mtime
+        tz = images_xml.now_kyiv().tzinfo
+        export_time = datetime.fromtimestamp(mtime, tz=tz).isoformat(timespec="seconds")
+        with cards_file.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        products = (
+            data.get("products")
+            if isinstance(data, dict)
+            else (data if isinstance(data, list) else None)
+        )
+        if isinstance(products, list) and products:
+            return products, export_time
+    except Exception as exc:
+        log(f"Не вдалося завантажити products_cards_export.json: {exc}")
+    return None
+
+
 def load_or_refresh_catalog(
     *,
     client: HoroshopClient,
@@ -699,6 +723,27 @@ def load_or_refresh_catalog(
         state = get_state()
         cached_products = list(state.catalog_products)
         cached_meta = state.catalog_meta()
+
+    output_dir = XML_CONFIG.get("output_dir") if isinstance(XML_CONFIG, dict) else None
+    if isinstance(output_dir, str):
+        output_dir = Path(output_dir)
+    if isinstance(output_dir, Path):
+        cards_result = try_load_cards_export(output_dir)
+        if cards_result:
+            cards_products, cards_time = cards_result
+            cached_time = str(cached_meta.get("updated_at") or "")
+            if not cached_products or (cached_time and cached_time < cards_time):
+                log(
+                    f"Оновлено кеш каталогу з products_cards_export.json "
+                    f"({len(cards_products)} товарів від {cards_time})."
+                )
+                with STATE_LOCK:
+                    state = get_state()
+                    state.set_catalog_products(cards_products)
+                    state.catalog_updated_at = cards_time
+                    state.save()
+                    cached_products = list(state.catalog_products)
+                    cached_meta = state.catalog_meta()
 
     if cached_products and not force_refresh:
         return CatalogIndex.from_raw(cached_products), {

@@ -202,6 +202,26 @@ class ImportPayloadTests(unittest.TestCase):
 
 
 class ImportResponseTests(unittest.TestCase):
+    def test_http_error_rate_limit_handled(self):
+        from horoshop_sync import HoroshopClient, HoroshopError
+        from unittest.mock import MagicMock
+        settings = HoroshopSettings(domain="https://shop.example.com", token="tok")
+        client = HoroshopClient(settings)
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "status": "HTTP_ERROR",
+            "response": {
+                "code": 429,
+                "message": "You hour requests limit has been exceeded. Retry after 1500 seconds",
+            },
+        }
+        client.session.post = MagicMock(return_value=mock_response)
+        with self.assertRaises(HoroshopError) as ctx:
+            client.export_products()
+        self.assertIn("Перевищено годинний ліміт запитів", str(ctx.exception))
+        self.assertIn("429", str(ctx.exception))
+
     def test_warning_with_image_error_is_failed(self):
         response = {
             "status": "WARNING",

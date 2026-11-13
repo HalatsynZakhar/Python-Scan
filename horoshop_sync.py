@@ -30,7 +30,7 @@ class HoroshopSettings:
     auth_endpoint: str = "/api/auth/"
     export_endpoint: str = "/api/catalog/export/"
     import_endpoint: str = "/api/catalog/import/"
-    request_timeout_seconds: int = 60
+    request_timeout_seconds: int = 120
     export_limit: int = DEFAULT_LIMIT
     batch_size: int = DEFAULT_BATCH_SIZE
     image_field: str = "images"
@@ -103,7 +103,7 @@ def load_horoshop_settings(raw: dict[str, Any]) -> HoroshopSettings:
         auth_endpoint=str(horoshop.get("auth_endpoint", "/api/auth/")),
         export_endpoint=str(horoshop.get("export_endpoint", "/api/catalog/export/")),
         import_endpoint=str(horoshop.get("import_endpoint", "/api/catalog/import/")),
-        request_timeout_seconds=int(horoshop.get("request_timeout_seconds", 60)),
+        request_timeout_seconds=int(horoshop.get("request_timeout_seconds", 120)),
         export_limit=min(DEFAULT_LIMIT, int(horoshop.get("export_limit", DEFAULT_LIMIT))),
         batch_size=max(1, int(horoshop.get("batch_size", DEFAULT_BATCH_SIZE))),
         image_field=image_field,
@@ -257,10 +257,19 @@ class HoroshopClient:
         if not isinstance(data, dict):
             raise HoroshopError("Hорошоп повернув JSON не у форматі об'єкта.")
         status = str(data.get("status", "")).upper()
-        if status in {"ERROR", "EXCEPTION"}:
-            raise HoroshopError(f"Hорошоп повернув статус {status}: {data}")
-        if status and status not in {"OK", "WARNING"}:
-            raise HoroshopError(f"Невідомий статус Хорошоп API: {status}")
+        if status not in {"OK", "WARNING"}:
+            response_obj = data.get("response")
+            if isinstance(response_obj, dict):
+                code = response_obj.get("code")
+                msg = response_obj.get("message") or str(response_obj)
+                if code == 429 or "requests limit" in str(msg).lower():
+                    raise HoroshopError(
+                        f"Перевищено годинний ліміт запитів до Хорошопа (код {code or 429}): {msg}"
+                    )
+                raise HoroshopError(f"Помилка Хорошоп API ({status}, код {code}): {msg}")
+            if status in {"ERROR", "EXCEPTION"}:
+                raise HoroshopError(f"Хорошоп повернув статус {status}: {data}")
+            raise HoroshopError(f"Невідомий статус Хорошоп API: {status} ({data})")
         return data
 
 
